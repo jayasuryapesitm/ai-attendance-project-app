@@ -1,23 +1,48 @@
-from resemblyzer import VoiceEncoder, preprocess_wav
-import numpy as np 
 import io
-import librosa
+
+import numpy as np
 import streamlit as st
+
+
+class VoiceDependenciesMissing(RuntimeError):
+    pass
+
+
+def _load_voice_dependencies():
+    try:
+        import librosa
+        from resemblyzer import VoiceEncoder, preprocess_wav
+    except ModuleNotFoundError as error:
+        if error.name in {"librosa", "resemblyzer", "webrtcvad", "torch"}:
+            raise VoiceDependenciesMissing(
+                "Voice matching dependencies are not installed. Run "
+                "`python -m pip install -r requirements.txt`. On Windows, "
+                "install Microsoft C++ Build Tools first because Resemblyzer "
+                "depends on webrtcvad."
+            ) from error
+        raise
+
+    return librosa, VoiceEncoder, preprocess_wav
 
 
 @st.cache_resource
 def load_voice_encoder():
+    _, VoiceEncoder, _ = _load_voice_dependencies()
     return VoiceEncoder()
 
 
 def get_voice_embedding(audio_bytes):
     try:
+        librosa, _, preprocess_wav = _load_voice_dependencies()
         encoder = load_voice_encoder()
 
         audio, sr = librosa.load(io.BytesIO(audio_bytes), sr=16000)
         wav = preprocess_wav(audio)
         embedding = encoder.embed_utterance(wav)
         return embedding.tolist()
+    except VoiceDependenciesMissing as error:
+        st.error(str(error))
+        return None
     except Exception as e:
         st.error('Voice recog error')
         return None
@@ -47,6 +72,7 @@ def identify_speaker(new_embedding, candidates_dict, threshold=0.65):
 def process_bulk_audio(audio_bytes, candidates_dict, threshold=0.65):
 
     try:
+        librosa, _, preprocess_wav = _load_voice_dependencies()
         encoder = load_voice_encoder()
 
         audio, sr = librosa.load(io.BytesIO(audio_bytes), sr=16000)
@@ -71,6 +97,9 @@ def process_bulk_audio(audio_bytes, candidates_dict, threshold=0.65):
                     identified_results[sid] = score
 
         return identified_results
+    except VoiceDependenciesMissing as error:
+        st.error(str(error))
+        return {}
     except Exception as e:
         st.error('Bulk process error')
         return {}

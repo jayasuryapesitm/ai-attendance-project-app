@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timedelta, timezone
 
 import bcrypt
 import httpx
@@ -371,6 +372,42 @@ def close_class_session(session_id, teacher_id):
     if not response.data:
         raise ValueError('The class session could not be closed.')
     return response.data[0]
+
+
+def extend_class_session(session_id, teacher_id):
+    session_response = (
+        supabase.table("class_sessions")
+        .select("expires_at, closed_at")
+        .eq("session_id", session_id)
+        .eq("teacher_id", teacher_id)
+        .execute()
+    )
+    if not session_response.data:
+        raise ValueError("The live class session could not be found.")
+
+    session = session_response.data[0]
+    if session.get("closed_at") is not None:
+        raise ValueError("A closed class session cannot be extended.")
+
+    expires_at = datetime.fromisoformat(
+        session["expires_at"].replace("Z", "+00:00")
+    )
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= datetime.now(timezone.utc):
+        raise ValueError("An expired class session cannot be extended.")
+
+    updated = (
+        supabase.table("class_sessions")
+        .update({"expires_at": (expires_at + timedelta(minutes=5)).isoformat()})
+        .eq("session_id", session_id)
+        .eq("teacher_id", teacher_id)
+        .is_("closed_at", "null")
+        .execute()
+    )
+    if not updated.data:
+        raise ValueError("The class session could not be extended.")
+    return updated.data[0]
 
 
 def get_class_sessions_for_teacher(teacher_id):

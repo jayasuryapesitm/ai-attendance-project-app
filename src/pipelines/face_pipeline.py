@@ -54,6 +54,36 @@ def get_face_embeddings(image_np, expected_face_count=0):
         encodings.append(np.array(face_descriptor))
     return encodings
 
+
+def detect_face_boxes(image_np):
+    detector, _, _ = load_dlib_models()
+    height, width = image_np.shape[:2]
+    scale_x = scale_y = 1.0
+    detection_image = image_np
+    max_dimension = max(height, width)
+    if max_dimension > 1600:
+        detection_width = int(width * 1600 / max_dimension)
+        detection_height = int(height * 1600 / max_dimension)
+        detection_image = np.asarray(
+            Image.fromarray(image_np).resize(
+                (detection_width, detection_height),
+                Image.BOX,
+            )
+        )
+        scale_x = width / detection_width
+        scale_y = height / detection_height
+
+    boxes = []
+    for face in detector(detection_image, 1):
+        left = max(0, min(width, round(face.left() * scale_x)))
+        top = max(0, min(height, round(face.top() * scale_y)))
+        right = max(0, min(width, round(face.right() * scale_x)))
+        bottom = max(0, min(height, round(face.bottom() * scale_y)))
+        if right > left and bottom > top:
+            boxes.append((left, top, right, bottom))
+    return boxes
+
+
 @st.cache_resource
 def get_trained_model():
     students = get_all_students()

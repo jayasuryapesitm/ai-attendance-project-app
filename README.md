@@ -1,5 +1,18 @@
 # ai-attendance-project-app
 
+## SmartAttend interface
+
+Start the application with `streamlit run app.py`. The top navigation keeps the
+Home, Student, Teacher, and Attendance Records views available, and the theme
+switch is stored for the current browser session. Students can use **Live Class
+Check-in** with the short-lived code from their teacher; teachers open and close
+those sessions from **Live Check-in**. Camera, microphone, and location access
+are requested only when the related flow is used. The campus count and optional
+geofence control on the home screen are explicitly illustrative; the application
+does not claim a campus-wide live-session count or configured campus boundary.
+Teachers can extend an active session by five minutes, rotate its access code,
+or close it to lock check-in.
+
 ## Supabase setup
 
 Before using the student portal, run `sql/students.sql` in the Supabase SQL
@@ -27,6 +40,11 @@ per-subject voice dialog does not collect location. In the main Live Check-in
 panel, students can optionally share GPS for either verification method.
 Voice fields support live microphone recording and WAV, MP3, OGG, WEBM, or M4A
 uploads. Use the upload option if the browser blocks microphone access.
+On Windows, install [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+with the C++ build workload before installing `requirements.txt`. Resemblyzer
+depends on `webrtcvad`, which compiles a native extension. Then run
+`python -m pip install -r requirements.txt` from the project root and restart
+Streamlit.
 
 ## Live, trust-aware class check-in
 

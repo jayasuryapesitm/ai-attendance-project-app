@@ -1,7 +1,5 @@
 import streamlit as st
 
-from src.ui.base_layout import style_background_dashboard, style_base_layout
-
 from src.components.header import header_dashboard
 from src.components.subject_card import subject_card
 from src.components.voice_input import voice_input
@@ -48,6 +46,7 @@ def student_dashboard():
         logs = get_student_attendance(student_id)
         voice_submissions = get_student_voice_attendance(student_id)
 
+    _render_student_profile(student_data, logs)
     _render_student_privacy_controls(student_data)
     _render_live_class_checkin(student_data)
 
@@ -114,6 +113,80 @@ def student_dashboard():
                     )
 
                     student_voice_attendance_dialog(sub, student_data)
+
+    _render_recent_checkins(logs)
+
+
+def _render_student_profile(student_data, logs):
+    import pandas as pd
+
+    present_count = sum(bool(log.get("is_present")) for log in logs)
+    held_count = len(logs)
+    attendance_rate = (100 * present_count / held_count) if held_count else 0
+    dated_logs = [
+        log
+        for log in logs
+        if log.get("timestamp")
+    ]
+    dated_logs.sort(
+        key=lambda log: pd.to_datetime(log["timestamp"], errors="coerce", utc=True),
+        reverse=True,
+    )
+    attendance_streak = 0
+    for log in dated_logs:
+        if not log.get("is_present"):
+            break
+        attendance_streak += 1
+
+    st.subheader("Student profile")
+    st.markdown(
+        f"**{student_data['name']}** · Student ID "
+        f"`#ST-{student_data['student_id']}` · "
+        f"{'On track' if attendance_rate >= 75 else 'Needs attention'}"
+    )
+    first, second, third, fourth = st.columns(4)
+    first.metric("Attendance", f"{attendance_rate:.1f}%")
+    second.metric("Classes attended", f"{present_count} / {held_count}")
+    third.metric("Current streak", f"{attendance_streak} classes")
+    fourth.metric(
+        "Face profile",
+        "Calibrated" if student_data.get("face_embedding") else "Not enrolled",
+    )
+    st.caption(
+        "Voice profile: Enrolled"
+        if student_data.get("voice_embedding")
+        else "Voice profile: Not enrolled"
+    )
+
+
+def _render_recent_checkins(logs):
+    import pandas as pd
+
+    st.subheader("Recent check-ins")
+    if not logs:
+        st.info("Your check-in history will appear here after your first class.")
+        return
+
+    history = []
+    for log in logs:
+        subject = log.get("subjects") or {}
+        timestamp = pd.to_datetime(log.get("timestamp"), errors="coerce", utc=True)
+        history.append(
+            {
+                "Timestamp": timestamp,
+                "Course": (
+                    f"{subject.get('subject_code', '')} — "
+                    f"{subject.get('name', 'Course')}"
+                ).strip(" —"),
+                "Status": "Present" if log.get("is_present") else "Absent",
+                "Verification": log.get("verification_method", "Attendance record"),
+            }
+        )
+    recent = pd.DataFrame(history).sort_values("Timestamp", ascending=False).head(10)
+    recent["Timestamp"] = (
+        recent["Timestamp"].dt.tz_convert(None).dt.strftime("%Y-%m-%d %H:%M")
+    )
+    st.dataframe(recent, width="stretch", hide_index=True)
 
 
 @st.dialog("Delete student account")
@@ -191,12 +264,6 @@ def _render_live_class_checkin(student_data):
         help="You can type the code or open the link in your teacher's QR code.",
     ).strip()
 
-    method = st.radio(
-        "Verification method",
-        ("Face", "Voice"),
-        horizontal=True,
-        key=f"session_checkin_method_{student_id}",
-    )
     share_location = st.checkbox(
         "Share my current location with my teacher (optional)",
         key=f"share_checkin_location_{student_id}",
@@ -244,7 +311,8 @@ def _render_live_class_checkin(student_data):
             "without sending location."
         )
 
-    if method == "Face":
+    face_tab, voice_tab = st.tabs(["📷 Face Match", "🎙️ Voice Phrase"])
+    with face_tab:
         face_consent = st.checkbox(
             "I consent to checking this photo against my saved face profile.",
             key=f"face_checkin_consent_{student_id}",
@@ -314,9 +382,9 @@ def _render_live_class_checkin(student_data):
                 except Exception as error:
                     st.error(f"Check-in could not be submitted: {error}")
                     return
-            _show_checkin_result(checkin)
+            _show_checkin_result(checkin, "face", float(distance))
 
-    else:
+    with voice_tab:
         voice_consent = st.checkbox(
             "I consent to checking this recording against my voice profile.",
             key=f"voice_checkin_consent_{student_id}",
@@ -407,10 +475,10 @@ def _render_live_class_checkin(student_data):
                     else:
                         student_data.update(updated_student)
                         st.session_state.student_data.update(updated_student)
-            _show_checkin_result(checkin)
+            _show_checkin_result(checkin, "voice", float(score))
 
 
-def _show_checkin_result(checkin):
+def _show_checkin_result(checkin, method=None, score=None):
     if checkin["status"] == "pending":
         st.info(
             "Your match needs a quick teacher review. It will appear as pending "
@@ -418,6 +486,10 @@ def _show_checkin_result(checkin):
         )
     else:
         st.success("Check-in verified and attendance recorded.")
+    if method == "face" and score is not None:
+        st.caption(f"Face match distance: {score:.3f} (lower is closer).")
+    elif method == "voice" and score is not None:
+        st.caption(f"Voice match similarity: {score:.1%}.")
     if checkin.get("risk_flags"):
         st.caption(
             "Review flags: "
@@ -426,10 +498,6 @@ def _show_checkin_result(checkin):
 
 
 def student_screen():
-    style_background_dashboard()
-    style_base_layout()
-
-
     if "student_data" in st.session_state:
         student_dashboard()
         return

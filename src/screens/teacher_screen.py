@@ -1,17 +1,11 @@
 import streamlit as st
 
-from src.ui.base_layout import style_background_dashboard, style_base_layout
-
 from src.components.header import header_dashboard
 from src.components.subject_card import subject_card
 from src.ui.navigation import navigate_to
 
 
 def teacher_screen():
-
-    style_background_dashboard()
-    style_base_layout()
-
     if "teacher_data" in st.session_state:
         teacher_dashboard()
     elif 'teacher_login_type' not in st.session_state or st.session_state.teacher_login_type=="login":
@@ -134,6 +128,41 @@ def teacher_tab_take_attendance():
     has_photos = bool(st.session_state.attendance_images)
     if not has_photos:
         st.info('Add or capture at least one classroom photo to enable face analysis.')
+    else:
+        with st.expander("Preview classroom face locations"):
+            photo_index = st.selectbox(
+                "Photo to inspect",
+                range(len(st.session_state.attendance_images)),
+                format_func=lambda index: f"Photo {index + 1}",
+                key="classroom_face_preview_index",
+            )
+            if st.button(
+                "Detect and annotate faces",
+                key="annotate_classroom_faces",
+            ):
+                from PIL import Image, ImageDraw
+
+                import numpy as np
+
+                from src.pipelines.face_pipeline import detect_face_boxes
+
+                photo = st.session_state.attendance_images[photo_index].convert("RGB")
+                image_array = np.asarray(photo)
+                face_boxes = detect_face_boxes(image_array)
+                annotated = Image.fromarray(image_array.copy())
+                draw = ImageDraw.Draw(annotated)
+                line_width = max(2, round(max(annotated.size) / 500))
+                for box in face_boxes:
+                    draw.rectangle(box, outline=(0, 102, 204), width=line_width)
+                st.image(
+                    annotated,
+                    caption=f"{len(face_boxes)} face locations detected",
+                    width="stretch",
+                )
+                st.caption(
+                    "Face location is not an identity decision. Use roster analysis "
+                    "below to compare faces with enrolled profiles."
+                )
 
     c1, c2 = st.columns(2)
 
@@ -317,157 +346,9 @@ def teacher_tab_manage_subjects():
 
 
 def teacher_tab_attendance_records():
-    import pandas as pd
+    from src.screens.records_screen import records_screen
 
-    from src.database.db import get_attendance_for_teacher
-
-    st.header('Attendance Records')
-
-    teacher_id = st.session_state.teacher_data['teacher_id']
-
-    records = get_attendance_for_teacher(teacher_id)
-    if not records:
-        return
-    
-    data = []
-
-    for r in records:
-        ts = r.get('timestamp')
-        parsed_ts = pd.to_datetime(ts, utc=True) if ts else pd.NaT
-        class_session = r.get('class_sessions') or {}
-        session_started_at = class_session.get('started_at')
-        session_time = (
-            pd.to_datetime(session_started_at, utc=True)
-            if session_started_at
-            else parsed_ts
-        )
-        subject = r['subjects']
-        student = r.get('students') or {}
-        class_session_id = r.get('class_session_id')
-        session_key = (
-            f"class:{class_session_id}"
-            if class_session_id is not None
-            else f"legacy:{parsed_ts.floor('s').isoformat()}"
-            if not pd.isna(parsed_ts)
-            else 'legacy:unknown'
-        )
-
-        data.append({
-            "ts_group": session_key,
-            "Session_Order": session_time,
-            "Time": session_time.strftime("%Y-%m-%d %I:%M %p") if not pd.isna(session_time) else "N'A",
-            "Subject ID": subject['subject_id'],
-            "Subject": subject['name'],
-            "Subject Code": subject['subject_code'],
-            "Student ID": r['student_id'],
-            "Name": student.get('name', 'Unknown'),
-            "is_present": bool(r.get('is_present', False))
-        })
-
-    df = pd.DataFrame(data)
-
-    detail_df = df.drop_duplicates(
-        subset=['Subject ID', 'ts_group', 'Student ID'],
-        keep='last',
-    ).copy()
-    sessions = (
-        detail_df[['Subject ID', 'Student ID', 'ts_group', 'Session_Order']]
-        .drop_duplicates(subset=['Subject ID', 'Student ID', 'ts_group'])
-        .sort_values(['Subject ID', 'Student ID', 'Session_Order'])
-    )
-    sessions['Classes Held (through this class)'] = (
-        sessions.groupby(['Subject ID', 'Student ID']).cumcount() + 1
-    )
-    sessions = sessions.drop(columns=['Session_Order'])
-    detail_df = detail_df.merge(
-        sessions,
-        on=['Subject ID', 'Student ID', 'ts_group'],
-        how='left',
-    )
-    detail_df = detail_df.sort_values(
-        ['Subject ID', 'Session_Order', 'Student ID']
-    )
-    detail_df['Classes Attended (through this class)'] = (
-        detail_df.groupby(['Subject ID', 'Student ID'])['is_present'].cumsum()
-    )
-    detail_df['Attendance'] = detail_df['is_present'].map(
-        {True: 'Present', False: 'Absent'}
-    )
-    csv_df = detail_df[
-        [
-            'Time',
-            'Subject',
-            'Subject Code',
-            'Name',
-            'Student ID',
-            'Attendance',
-            'Classes Attended (through this class)',
-            'Classes Held (through this class)',
-        ]
-    ]
-
-    st.download_button(
-        'Download detailed attendance CSV',
-        data=csv_df.to_csv(index=False).encode('utf-8-sig'),
-        file_name='attendance_records.csv',
-        mime='text/csv',
-    )
-
-    summary = (
-        df.groupby(['ts_group', 'Time', 'Subject', 'Subject Code'])
-        .agg(
-            Present_Count = ('is_present', 'sum'),
-            Total_Count =('is_present', 'count'),
-            Session_Order=('Session_Order', 'min'),
-        ).reset_index()
-
-    )
-
-    summary['Attendance Stats'] = (
-        "✅ " + summary['Present_Count'].astype(str) + " /"
-        + summary['Total_Count'].astype(str) + ' Students'
-    )
-
-    display_df = ( summary.sort_values(by='Session_Order' ,ascending=False)
-                  [['Time', 'Subject', 'Subject Code', 'Attendance Stats']]
-                  )
-    
-    st.dataframe(display_df, width='stretch', hide_index=True)
-
-    student_summary = (
-        detail_df.groupby(['Subject', 'Subject Code', 'Student ID', 'Name'])
-        .agg(
-            Classes_Attended=('is_present', 'sum'),
-            Classes_Held=('is_present', 'count'),
-        )
-        .reset_index()
-    )
-    student_summary['Attendance Rate'] = (
-        100 * student_summary['Classes_Attended'] / student_summary['Classes_Held']
-    ).round(1)
-    student_summary = student_summary.rename(columns={
-        'Classes_Attended': 'Classes Attended',
-        'Classes_Held': 'Classes Held',
-    })
-    st.subheader('Student attendance trends')
-    st.caption(
-        "Rates are calculated from the attendance records currently stored in "
-        "the system; review the underlying sessions before making decisions."
-    )
-    st.dataframe(
-        student_summary.sort_values(
-            ['Attendance Rate', 'Name'], ascending=[True, True]
-        ),
-        width='stretch',
-        hide_index=True,
-    )
-    low_attendance = student_summary[student_summary['Attendance Rate'] < 75]
-    if not low_attendance.empty:
-        st.warning(
-            f"{len(low_attendance)} student-course record(s) are below 75% "
-            "attendance. Use this as an early-support signal, not an automated "
-            "disciplinary decision."
-        )
+    records_screen()
 
 
 def teacher_tab_voice_reviews():
@@ -482,6 +363,10 @@ def teacher_tab_voice_reviews():
     subject_ids = [subject['subject_id'] for subject in subjects]
 
     st.header('Pending Voice Attendance')
+    st.caption(
+        "Voice samples are processed for matching and are not retained. Review the "
+        "recorded match score and request a new check-in when needed."
+    )
     submissions = get_pending_voice_attendance_for_subjects(subject_ids)
     if not submissions:
         st.info('There are no voice attendance requests waiting for review.')
@@ -555,6 +440,7 @@ def teacher_tab_live_sessions():
 
     from src.database.db import (
         close_class_session,
+        extend_class_session,
         get_class_sessions_for_teacher,
         get_pending_class_checkins,
         get_teacher_subjects,
@@ -631,6 +517,9 @@ def teacher_tab_live_sessions():
             st.caption(
                 f"Expires at {expires_at.astimezone().strftime('%Y-%m-%d %I:%M %p')}"
             )
+            remaining_seconds = max(0, int((expires_at - now).total_seconds()))
+            minutes, seconds = divmod(remaining_seconds, 60)
+            st.metric("Session window", f"{minutes:02d}:{seconds:02d} remaining")
 
             parsed_url = urlsplit(st.context.url)
             checkin_url = urlunsplit((
@@ -665,7 +554,20 @@ def teacher_tab_live_sessions():
                     'network-accessible deployment when students scan it.'
                 )
 
-            rotate_col, close_col = st.columns(2)
+            extend_col, rotate_col, close_col = st.columns(3)
+            with extend_col:
+                if st.button(
+                    "Extend session (+5m)",
+                    key=f"extend_session_{session['session_id']}",
+                    width="stretch",
+                ):
+                    try:
+                        extend_class_session(session['session_id'], teacher_id)
+                    except Exception as error:
+                        st.error(f'Could not extend the session: {error}')
+                    else:
+                        st.success('Session extended by five minutes.')
+                        st.rerun()
             with rotate_col:
                 if st.button(
                     'Rotate code',

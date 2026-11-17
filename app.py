@@ -2,19 +2,34 @@
 import streamlit as st
 
 from src.screens.home_screen import home_screen
+from src.ui.base_layout import render_top_navigation, style_base_layout
 
 def main():
     st.set_page_config(
-        page_title='SnapClass - Making Attendance faster using AI',
-        page_icon= "https://i.ibb.co/YTYGn5qV/logo.png"
+        page_title='SmartAttend',
+        page_icon="🎓",
+        layout="wide",
     )
-    if 'login_type' not in st.session_state:
-        st.session_state['login_type'] = None
+    st.session_state.setdefault("theme", "light")
+    st.session_state.setdefault("login_type", None)
+    st.session_state.setdefault("current_role", None)
 
-    page = st.query_params.get('page')
-    if page not in ('home', 'student', 'teacher'):
-        page = 'student' if st.query_params.get('join-code') else 'home'
-    st.session_state['login_type'] = None if page == 'home' else page
+    requested_page = st.query_params.get("page")
+    if requested_page not in ("home", "student", "teacher", "records"):
+        requested_page = (
+            "student"
+            if st.query_params.get("join-code")
+            or st.query_params.get("session-code")
+            else st.session_state.get("page", "home")
+        )
+    page = requested_page
+    st.session_state["page"] = page
+    if page in ("student", "teacher"):
+        st.session_state["current_role"] = page
+    st.session_state["login_type"] = None if page == "home" else page
+
+    style_base_layout()
+    render_top_navigation(page)
 
     match page:
         case 'teacher':
@@ -29,6 +44,10 @@ def main():
         
         case 'home':
             home_screen()
+        case 'records':
+            from src.screens.records_screen import records_screen
+
+            records_screen()
 
     join_code = st.query_params.get('join-code')
     if (
