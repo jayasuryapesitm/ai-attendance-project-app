@@ -1,5 +1,7 @@
 
 
+import logging
+
 import dlib
 import numpy as np
 import face_recognition_models
@@ -7,7 +9,15 @@ from PIL import Image
 import streamlit as st
 
 from src.database.db import get_all_students
-from src.pipelines.face_matching import FACE_MATCH_THRESHOLD, match_face_embeddings
+from src.pipelines.face_matching import (
+    FACE_MATCH_THRESHOLD,
+    evaluate_face_match,
+    match_face_embeddings,
+)
+
+
+FACE_EMBEDDING_SIZE = 128
+logger = logging.getLogger(__name__)
 
 
 @st.cache_resource
@@ -91,17 +101,69 @@ def get_trained_model():
     if not students:
         return None
 
+    students_by_id = {}
+    duplicate_student_ids = set()
+    for student in students:
+        if not isinstance(student, dict):
+            logger.warning("Skipping a face profile without a valid student row.")
+            continue
+        try:
+            student_id = int(student.get('student_id'))
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("Skipping a face profile with an invalid student ID.")
+            continue
+        if student_id <= 0:
+            logger.warning("Skipping a face profile with an invalid student ID.")
+            continue
+        if student_id in students_by_id:
+            duplicate_student_ids.add(student_id)
+        else:
+            students_by_id[student_id] = student
+
+    for student_id in duplicate_student_ids:
+        logger.error(
+            "Excluding duplicate face profiles for student_id=%s.",
+            student_id,
+        )
+        students_by_id.pop(student_id, None)
+
     embeddings = []
     student_ids = []
-    students_by_id = {}
+    valid_students_by_id = {}
 
-    for student in students:
-        embedding = student.get('face_embedding')
-        if embedding:
-            student_id = student.get('student_id')
-            embeddings.append(np.asarray(embedding, dtype=np.float64))
-            student_ids.append(student_id)
-            students_by_id[student_id] = student
+    for student_id, student in students_by_id.items():
+        if not isinstance(student.get('name'), str) or not student['name'].strip():
+            logger.warning(
+                "Skipping face profile without a valid name, student_id=%s.",
+                student_id,
+            )
+            continue
+        try:
+            embedding = np.asarray(
+                student.get('face_embedding'),
+                dtype=np.float64,
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "Skipping malformed face embedding, student_id=%s.",
+                student_id,
+            )
+            continue
+        if (
+            embedding.shape != (FACE_EMBEDDING_SIZE,)
+            or not np.isfinite(embedding).all()
+        ):
+            logger.warning(
+                "Skipping invalid face embedding, student_id=%s.",
+                student_id,
+            )
+            continue
+
+        embeddings.append(embedding)
+        student_ids.append(student_id)
+        valid_student = dict(student)
+        valid_student['student_id'] = student_id
+        valid_students_by_id[student_id] = valid_student
 
     if not embeddings:
         return None
@@ -109,7 +171,7 @@ def get_trained_model():
     return {
         'embeddings': np.vstack(embeddings),
         'student_ids': student_ids,
-        'students_by_id': students_by_id,
+        'students_by_id': valid_students_by_id,
     }
 
 
@@ -127,7 +189,16 @@ def predict_attendance(
     model_data = get_trained_model()
 
     if not model_data:
-        return {}, len(encodings), len(encodings)
+        detected_student, matched_face_count = match_face_embeddings(
+            encodings,
+            None,
+            candidate_student_ids,
+        )
+        return (
+            detected_student,
+            len(encodings),
+            len(encodings) - matched_face_count,
+        )
 
     detected_student, matched_face_count = match_face_embeddings(
         encodings,
@@ -144,28 +215,65 @@ def predict_attendance(
 def identify_student(image_np):
     encodings = get_face_embeddings(image_np)
     if len(encodings) != 1:
+        logger.info(
+            "Face identification rejected rejection_reason=expected_one_face "
+            "detected_face_count=%s",
+            len(encodings),
+        )
         return None, len(encodings)
 
     model_data = get_trained_model()
     if not model_data:
+        evaluate_face_match(encodings[0], None)
         return None, len(encodings)
 
-    encoding = encodings[0]
-    distances = np.linalg.norm(model_data['embeddings'] - encoding, axis=1)
-    best_index = int(np.argmin(distances))
-    if distances[best_index] > FACE_MATCH_THRESHOLD:
+    student_id, _, _, _ = evaluate_face_match(encodings[0], model_data)
+    if student_id is None:
         return None, len(encodings)
 
-    student_id = model_data['student_ids'][best_index]
-    return model_data['students_by_id'][student_id], len(encodings)
+    student = model_data['students_by_id'].get(student_id)
+    if student is None:
+        logger.error(
+            "Matched student_id=%s has no associated student record.",
+            student_id,
+        )
+        return None, len(encodings)
+    return student, len(encodings)
 
 
 def measure_face_match(image_np, saved_embedding):
     encodings = get_face_embeddings(image_np)
     if len(encodings) != 1:
+        logger.info(
+            "Claimed face profile match rejected "
+            "rejection_reason=expected_one_face detected_face_count=%s",
+            len(encodings),
+        )
         return None, len(encodings)
 
-    distance = float(np.linalg.norm(
-        np.asarray(saved_embedding, dtype=np.float64) - encodings[0]
-    ))
+    try:
+        saved_embedding = np.asarray(saved_embedding, dtype=np.float64)
+    except (TypeError, ValueError):
+        logger.warning("Rejecting malformed saved face embedding.")
+        return None, len(encodings)
+    if (
+        saved_embedding.shape != (FACE_EMBEDDING_SIZE,)
+        or not np.isfinite(saved_embedding).all()
+    ):
+        logger.warning("Rejecting invalid saved face embedding.")
+        return None, len(encodings)
+
+    distance = float(np.linalg.norm(saved_embedding - encodings[0]))
+    rejection_reason = (
+        'distance_above_threshold'
+        if not np.isfinite(distance) or distance > FACE_MATCH_THRESHOLD
+        else 'none'
+    )
+    logger.info(
+        "Claimed face profile match rejection_reason=%s distance=%s "
+        "threshold=%.3f",
+        rejection_reason,
+        f"{distance:.6f}" if np.isfinite(distance) else "unavailable",
+        FACE_MATCH_THRESHOLD,
+    )
     return distance, len(encodings)

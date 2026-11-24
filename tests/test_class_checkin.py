@@ -18,7 +18,7 @@ class ClassCheckinTests(unittest.TestCase):
 
     def test_sends_borderline_face_match_to_teacher_review(self):
         self.assertEqual(
-            checkin_decision("face", 0.5),
+            checkin_decision("face", 0.4),
             ("pending", ("borderline_face_match",)),
         )
 
@@ -41,7 +41,7 @@ class ClassCheckinTests(unittest.TestCase):
 
     def test_flags_inaccurate_optional_location(self):
         self.assertEqual(
-            checkin_risk_flags("face", 0.5, location_accuracy_m=250),
+            checkin_risk_flags("face", 0.4, location_accuracy_m=250),
             ("borderline_face_match", "low_gps_accuracy"),
         )
         self.assertEqual(checkin_risk_flags("face", 0.3), ())

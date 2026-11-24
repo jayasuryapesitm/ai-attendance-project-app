@@ -23,6 +23,9 @@ def student_dashboard():
         if st.button("Logout", type='secondary', key='loginbackbtn', shortcut="control+backspace"):
             st.session_state['is_logged_in'] = False
             del st.session_state.student_data 
+            st.session_state['student_face_scan_generation'] = (
+                st.session_state.get('student_face_scan_generation', 0) + 1
+            )
             st.rerun()
 
 
@@ -545,10 +548,40 @@ def student_screen():
                 load_dlib_models()
                 get_trained_model()
 
-        photo_source = st.camera_input(
+        camera_photo = st.camera_input(
             "Position your face in the center",
             disabled=not sign_in_consent,
+            key=(
+                "student_face_signin_camera_"
+                f"{st.session_state.get('student_face_scan_generation', 0)}"
+            ),
         )
+        uploaded_photo = None
+        if sign_in_consent and camera_photo is None:
+            st.caption(
+                "If the camera is busy, close other apps or browser tabs using "
+                "it, or upload a clear face photo instead."
+            )
+            uploaded_photo = st.file_uploader(
+                "Upload a face photo if the camera is unavailable",
+                type=["jpg", "jpeg", "png"],
+                key=(
+                    "student_face_signin_upload_"
+                    f"{st.session_state.get('student_face_scan_generation', 0)}"
+                ),
+            )
+        photo_source = camera_photo if camera_photo is not None else uploaded_photo
+        photo_image = None
+        if photo_source is not None:
+            import numpy as np
+            from PIL import Image
+
+            try:
+                with Image.open(photo_source) as image:
+                    photo_image = np.array(image.convert("RGB"))
+            except (OSError, ValueError):
+                st.error("Could not read that image. Choose a valid JPG or PNG photo.")
+                photo_source = None
 
         if not show_registration and st.button(
             "Register or re-enroll instead",
@@ -557,16 +590,11 @@ def student_screen():
             st.session_state['show_student_registration'] = True
             st.rerun()
 
-        if photo_source and not show_registration:
-            import numpy as np
-            from PIL import Image
-
+        if photo_image is not None and not show_registration:
             from src.pipelines.face_pipeline import identify_student
 
-            img = np.array(Image.open(photo_source))
-
             with st.spinner('AI is scanning..'):
-                student, num_faces = identify_student(img)
+                student, num_faces = identify_student(photo_image)
 
                 if num_faces == 0:
                     st.warning(
@@ -592,7 +620,9 @@ def student_screen():
                         st.toast(f'Welcome Back {student["name"]}')
                         st.rerun()
                 else:
-                    st.info('Face not recognized! Register your profile below.')
+                    st.warning(
+                        'Face Not Recognized – Student Not Registered.'
+                    )
                     show_registration = True
     else:
         st.info(
@@ -661,11 +691,12 @@ def student_screen():
             st.header('Register new Profile')
             st.info(
                 "Your face embedding is stored for FaceID sign-in and matching; "
-                "the captured photo is not retained. Voice enrollment is optional "
-                "and stores a numeric template, not the recording."
+                "captured or uploaded photos are processed for matching and not "
+                "retained. Voice enrollment is optional and stores a numeric "
+                "template, not the recording."
             )
             if not photo_source:
-                st.info('Take a clear face photo above to create your profile.')
+                st.info('Take or upload a clear face photo above to create your profile.')
             new_name = st.text_input("Enter your name", placeholder='E.g. Zulker')
 
             st.subheader('Optional : Voice Enrollment')
@@ -693,9 +724,6 @@ def student_screen():
             ):
                 if new_name:
                     with st.spinner('Creating profile..'):
-                        import numpy as np
-                        from PIL import Image
-
                         from src.database.db import create_student
                         from src.pipelines.face_pipeline import (
                             get_face_embeddings,
@@ -703,8 +731,7 @@ def student_screen():
                         )
                         from src.pipelines.voice_pipeline import get_voice_embedding
 
-                        img = np.array(Image.open(photo_source))
-                        encodings= get_face_embeddings(img)
+                        encodings= get_face_embeddings(photo_image)
                         if len(encodings) == 1:
                             face_emb = encodings[0].tolist()
 
