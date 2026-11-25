@@ -65,7 +65,7 @@ def compress_uploaded_pages(uploaded_file):
                     "PDF uploads require PyMuPDF in the Python environment "
                     "running Streamlit. Install it with "
                     "`python -m pip install PyMuPDF google-genai`, then restart "
-                    "SmartAttend."
+                    "ClassLens.ai."
                 ) from error
         pages = []
         with pdf_engine.open(stream=raw, filetype="pdf") as document:
@@ -155,7 +155,7 @@ def _call_vision_json(prompt, page_images):
     except ImportError as error:
         raise RuntimeError(
             "AI paper evaluation requires google-genai. Install the project "
-            "requirements and restart SmartAttend."
+            "requirements and restart ClassLens.ai."
         ) from error
 
     content = [prompt]

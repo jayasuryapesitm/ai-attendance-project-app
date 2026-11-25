@@ -74,6 +74,22 @@ def teacher_dashboard():
             st.session_state.current_teacher_tab = 'paper_evaluation'
             st.rerun()
 
+    assignment_columns = st.columns([1, 2, 1])
+    with assignment_columns[1]:
+        assignment_type = (
+            "primary"
+            if st.session_state.current_teacher_tab == "mentor_assignments"
+            else "tertiary"
+        )
+        if st.button(
+            "Assign Students to Mentors",
+            type=assignment_type,
+            width="stretch",
+            icon=":material/group_add:",
+        ):
+            st.session_state.current_teacher_tab = "mentor_assignments"
+            st.rerun()
+
 
     st.divider()
 
@@ -89,6 +105,10 @@ def teacher_dashboard():
         teacher_tab_live_sessions()
     if st.session_state.current_teacher_tab == "paper_evaluation":
         teacher_tab_paper_evaluation()
+    if st.session_state.current_teacher_tab == "mentor_assignments":
+        from src.screens.teacher_assignment_screen import teacher_assignment_dashboard
+
+        teacher_assignment_dashboard()
 
     
 
@@ -557,7 +577,7 @@ def teacher_tab_paper_evaluation():
         st.warning(
             "AI paper grading is not configured yet. Add your Gemini API key as "
             "`GEMINI_API_KEY` in `.streamlit/secrets.toml` or as an environment "
-            "variable, then restart SmartAttend."
+            "variable, then restart ClassLens.ai."
         )
 
     create_generation_key = f"paper_create_generation_{subject_id}"
