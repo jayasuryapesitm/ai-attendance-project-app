@@ -132,10 +132,29 @@ def style_base_layout():
         .stApp [data-testid="stFileUploaderDropzone"] {{
             border-color: var(--sa-border) !important;
         }}
+        .stApp [data-testid="stFileUploaderDropzone"] *,
+        .stApp [data-testid="stFileUploader"] small,
+        .stApp [data-testid="stFileUploader"] span {{
+            color: var(--sa-text) !important;
+        }}
+        .stApp [data-testid="stFileUploader"] button {{
+            background: var(--sa-raised-surface) !important;
+            background-color: var(--sa-raised-surface) !important;
+            color: var(--sa-text) !important;
+            border: 1px solid var(--sa-border) !important;
+        }}
+        .stApp [data-testid="stFileUploader"] button * {{
+            color: var(--sa-text) !important;
+        }}
         .stApp [data-testid="stAlert"] {{
             background: var(--sa-raised-surface) !important;
             border-color: var(--sa-border) !important;
             color: var(--sa-text) !important;
+        }}
+        .stApp [data-testid="stAlert"] * {{
+            color: var(--sa-text) !important;
+            background-color: transparent !important;
+            background-image: none !important;
         }}
         .stApp [data-testid="stSpinner"],
         .stApp [data-testid="stStatusWidget"],

@@ -118,6 +118,284 @@ def student_dashboard():
                     student_voice_attendance_dialog(sub, student_data)
 
     _render_recent_checkins(logs)
+    _render_student_exam_portal(student_id)
+    _render_exam_results(student_id)
+
+
+def _render_student_exam_portal(student_id):
+    from src.database.db import (
+        get_available_exams_for_student,
+        get_student_exam_attempts,
+        submit_student_exam_attempt,
+    )
+    from src.pipelines.exam_marking import (
+        calculate_exam_result,
+        validate_student_answers,
+    )
+    from src.pipelines.paper_pipeline import (
+        decode_storage_paths,
+        download_stored_pages,
+        evaluate_configured_exam,
+    )
+
+    st.divider()
+    st.subheader("Online examinations")
+    try:
+        exams = get_available_exams_for_student(student_id)
+        attempts = get_student_exam_attempts(student_id)
+    except Exception as error:
+        st.error(f"Could not load online examinations: {error}")
+        return
+
+    if attempts:
+        with st.expander("Your submitted exams", expanded=False):
+            for attempt in attempts:
+                exam = attempt.get("exam_papers") or {}
+                subject = exam.get("subjects") or {}
+                st.markdown(
+                    f"**{exam.get('title', 'Exam')}** · "
+                    f"{subject.get('name', 'Subject')} "
+                    f"({subject.get('subject_code', '')})"
+                )
+                if attempt["status"] == "verified":
+                    st.success(
+                        f"Verified: {attempt.get('final_marks')} / "
+                        f"{exam.get('max_marks')}"
+                    )
+                else:
+                    st.info("Submitted; waiting for teacher review.")
+
+    if not exams:
+        st.info("No new online exams are currently available for your subjects.")
+        return
+
+    for exam in exams:
+        scheme = exam["marking_scheme"]
+        subject = exam.get("subjects") or {}
+        with st.container(border=True):
+            st.markdown(
+                f"### {exam['title']} · {subject.get('name', 'Subject')} "
+                f"({subject.get('subject_code', '')})"
+            )
+            st.caption(
+                f"Total: {exam['max_marks']} marks · One submission per exam."
+            )
+            paper_path = exam.get("question_paper_path")
+            if paper_path:
+                with st.expander("View question paper"):
+                    try:
+                        pages = download_stored_pages(
+                            decode_storage_paths(paper_path)
+                        )
+                        for page_index, page in enumerate(pages, start=1):
+                            st.image(
+                                page,
+                                caption=f"Question paper page {page_index}",
+                            )
+                    except Exception as error:
+                        st.warning(f"Could not display the question paper: {error}")
+
+            for module in scheme.get("modules", []):
+                st.markdown(
+                    f"**{module['name']} — {module['max_marks']} marks**"
+                )
+                for group in module.get("or_groups", []):
+                    st.info(
+                        f"OR group {group['label']}: answer whichever "
+                        f"alternative(s) you attempt. If you answer more than "
+                        f"{group['allowed_attempts']}, each is evaluated "
+                        "separately and only the highest-scoring permitted "
+                        "alternative(s) count."
+                    )
+                for question in module.get("questions", []):
+                    if question.get("or_group_id"):
+                        st.caption(
+                            f"{question['label']} — {question['max_marks']} marks "
+                            f"(OR group {question['or_group_id']}; evaluated separately)"
+                        )
+                    else:
+                        st.caption(
+                            f"{question['label']} — {question['max_marks']} marks"
+                            + (" · Compulsory" if question.get("compulsory") else "")
+                        )
+                    for subquestion in question.get("subquestions", []):
+                        st.caption(
+                            f"{subquestion['label']} — "
+                            f"{subquestion['max_marks']} marks"
+                        )
+
+            with st.form(f"student_exam_attempt_{exam['exam_id']}"):
+                answer_text = {}
+                for module in scheme.get("modules", []):
+                    st.subheader(
+                        f"{module['name']} · {module['max_marks']} marks"
+                    )
+                    for question in module.get("questions", []):
+                        st.markdown(
+                            f"**{question['label']} · {question['max_marks']} marks**"
+                        )
+                        if question.get("or_group_id"):
+                            st.caption(
+                                "Alternative question; its answers are scored "
+                                "separately from the other OR alternatives."
+                            )
+                        targets = question.get("subquestions", [])
+                        if targets:
+                            for subquestion in targets:
+                                answer_text[subquestion["subquestion_id"]] = (
+                                    st.text_area(
+                                        f"Answer {subquestion['label']} "
+                                        f"({subquestion['max_marks']} marks)",
+                                        key=(
+                                            f"student_answer_{exam['exam_id']}_"
+                                            f"{subquestion['subquestion_id']}"
+                                        ),
+                                        height=120,
+                                    )
+                                )
+                        else:
+                            answer_text[question["question_id"]] = st.text_area(
+                                f"Answer {question['label']} "
+                                f"({question['max_marks']} marks)",
+                                key=(
+                                    f"student_answer_{exam['exam_id']}_"
+                                    f"{question['question_id']}"
+                                ),
+                                height=140,
+                            )
+                confirmed = st.checkbox(
+                    "I have reviewed my answers and understand the OR scoring rule.",
+                    key=f"student_exam_confirm_{exam['exam_id']}",
+                )
+                submitted = st.form_submit_button(
+                    "Submit examination",
+                    type="primary",
+                    disabled=not confirmed,
+                )
+            if submitted:
+                answers = {
+                    "answers": answer_text,
+                    "selected_alternatives": {},
+                }
+                try:
+                    answers = validate_student_answers(scheme, answers)
+                    with st.spinner("Evaluating your answers..."):
+                        target_scores = evaluate_configured_exam(
+                            scheme,
+                            text_answers=answers["answers"],
+                        )
+                        result = calculate_exam_result(
+                            scheme,
+                            target_scores,
+                        )
+                        submit_student_exam_attempt(
+                            exam["exam_id"],
+                            student_id,
+                            answers,
+                            result,
+                        )
+                except Exception as error:
+                    st.error(f"Could not submit this examination: {error}")
+                else:
+                    st.success(
+                        "Your answers were submitted and evaluated. The teacher "
+                        "will review the result before it is published."
+                    )
+                    st.rerun()
+
+
+def _render_exam_results(student_id):
+    from src.database.db import get_verified_paper_results
+
+    st.divider()
+    st.subheader("Exam Results")
+    try:
+        results = get_verified_paper_results(student_id)
+    except Exception as error:
+        st.error(f"Could not load your verified exam results: {error}")
+        return
+    if not results:
+        st.info(
+            "No verified exam scores were found for your account "
+            f"(Student ID #ST-{student_id})."
+        )
+        return
+
+    for result in results:
+        exam = result.get("exam_papers") or {}
+        subject = exam.get("subjects") or {}
+        with st.container(border=True):
+            st.markdown(
+                f"**{exam.get('title', 'Exam')}** · "
+                f"{subject.get('name', 'Subject')} "
+                f"({subject.get('subject_code', '')})"
+            )
+            question_paper_path = exam.get("question_paper_path")
+            if question_paper_path:
+                with st.expander("View question paper"):
+                    try:
+                        from src.pipelines.paper_pipeline import (
+                            decode_storage_paths,
+                            download_stored_pages,
+                        )
+
+                        question_pages = download_stored_pages(
+                            decode_storage_paths(question_paper_path)
+                        )
+                        for page_index, question_page in enumerate(
+                            question_pages, start=1
+                        ):
+                            st.image(
+                                question_page,
+                                caption=f"Question paper page {page_index}",
+                            )
+                    except Exception as error:
+                        st.warning(
+                            "The question paper could not be displayed: "
+                            f"{error}"
+                        )
+            st.metric(
+                "Verified score",
+                f"{result.get('final_marks')} / {exam.get('max_marks')}",
+            )
+            st.caption(f"Published {result.get('reviewed_at')}")
+            details = result.get("evaluation_details") or []
+            if isinstance(details, dict) and "modules" in details:
+                for module in details["modules"]:
+                    with st.expander(
+                        f"{module['name']} · {module['awarded_marks']} / "
+                        f"{module['max_marks']} marks"
+                    ):
+                        for question in module["questions"]:
+                            counted = (
+                                " · counted"
+                                if question.get("counted_for_score")
+                                else " · alternative not counted"
+                                if question.get("or_group_id")
+                                else ""
+                            )
+                            st.markdown(
+                                f"**{question['question_no']}** · "
+                                f"{question['awarded_marks']} / "
+                                f"{question['max_marks']} marks{counted}"
+                            )
+                            for subquestion in question.get("subquestions", []):
+                                st.caption(
+                                    f"{subquestion['question_no']} · "
+                                    f"{subquestion['awarded_marks']} / "
+                                    f"{subquestion['max_marks']} marks · "
+                                    f"{subquestion['semantic_match_pct']}% match"
+                                )
+                                st.caption(subquestion.get("feedback", ""))
+            else:
+                with st.expander("Question-wise feedback"):
+                    for question in details:
+                        st.markdown(
+                            f"**Question {question['question_no']}** · "
+                            f"{question['awarded_marks']} / {question['max_marks']} "
+                            f"({question['semantic_match_pct']}% semantic match)"
+                        )
+                        st.caption(question.get("feedback", ""))
 
 
 def _render_student_profile(student_data, logs):
@@ -331,17 +609,26 @@ def _render_live_class_checkin(student_data):
             key=f"class_checkin_camera_{student_id}",
             disabled=not face_consent,
         )
+        missing_face_requirements = []
+        if not (access_code.isdigit() and len(access_code) == 8):
+            missing_face_requirements.append("a valid 8-digit class access code")
+        if not face_consent:
+            missing_face_requirements.append("consent to face matching")
+        if photo is None:
+            missing_face_requirements.append("a photo capture")
+        if share_location and latitude is None:
+            missing_face_requirements.append("GPS location fix (or uncheck location sharing)")
+
+        if missing_face_requirements:
+            st.caption(
+                f"⚠️ **Cannot submit yet.** Please provide: {', '.join(missing_face_requirements)}."
+            )
+
         if st.button(
             "Verify and check in",
             type="primary",
             width="stretch",
-            disabled=(
-                not access_code.isdigit()
-                or len(access_code) != 8
-                or not face_consent
-                or photo is None
-                or (share_location and latitude is None)
-            ),
+            disabled=bool(missing_face_requirements),
             key=f"face_checkin_submit_{student_id}",
         ):
             from src.database.db import submit_class_checkin
@@ -410,18 +697,28 @@ def _render_live_class_checkin(student_data):
             key=f"checkin_voice_sample_{student_id}",
             disabled=not voice_consent,
         )
+        missing_voice_requirements = []
+        if not (access_code.isdigit() and len(access_code) == 8):
+            missing_voice_requirements.append("a valid 8-digit class access code")
+        if not voice_consent:
+            missing_voice_requirements.append("consent to voice matching")
+        if not voice_profile and profile_audio is None:
+            missing_voice_requirements.append("a voice profile sample (enrollment recording above)")
+        if attendance_audio is None:
+            missing_voice_requirements.append("a fresh check-in voice recording")
+        if share_location and latitude is None:
+            missing_voice_requirements.append("GPS location fix (or uncheck location sharing)")
+
+        if missing_voice_requirements:
+            st.caption(
+                f"⚠️ **Cannot submit yet.** Please provide: {', '.join(missing_voice_requirements)}."
+            )
+
         if st.button(
             "Verify voice and check in",
             type="primary",
             width="stretch",
-            disabled=(
-                not access_code.isdigit()
-                or len(access_code) != 8
-                or not voice_consent
-                or attendance_audio is None
-                or (not voice_profile and profile_audio is None)
-                or (share_location and latitude is None)
-            ),
+            disabled=bool(missing_voice_requirements),
             key=f"voice_checkin_submit_{student_id}",
         ):
             from src.database.db import (

@@ -1,5 +1,6 @@
 import streamlit as st
 
+
 from src.components.header import header_dashboard
 from src.components.subject_card import subject_card
 from src.ui.navigation import navigate_to
@@ -34,7 +35,7 @@ def teacher_dashboard():
 
     if "current_teacher_tab" not in st.session_state:
         st.session_state.current_teacher_tab = 'take_attendance'
-    tab1, tab2, tab3, tab4, tab5 = st.columns(5)
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.columns(6)
 
 
     with tab1:
@@ -67,6 +68,12 @@ def teacher_dashboard():
             st.session_state.current_teacher_tab = 'live_sessions'
             st.rerun()
 
+    with tab6:
+        type6 = "primary" if st.session_state.current_teacher_tab == 'paper_evaluation' else "tertiary"
+        if st.button('Paper Evaluation', type=type6, width='stretch', icon=':material/description:'):
+            st.session_state.current_teacher_tab = 'paper_evaluation'
+            st.rerun()
+
 
     st.divider()
 
@@ -80,6 +87,8 @@ def teacher_dashboard():
         teacher_tab_voice_reviews()
     if st.session_state.current_teacher_tab == "live_sessions":
         teacher_tab_live_sessions()
+    if st.session_state.current_teacher_tab == "paper_evaluation":
+        teacher_tab_paper_evaluation()
 
     
 
@@ -429,6 +438,1143 @@ def teacher_tab_voice_reviews():
                     else:
                         st.success('Attendance rejected.')
                         st.rerun()
+
+
+def teacher_tab_paper_evaluation():
+    import logging
+
+    from src.database.db import (
+        create_exam_paper,
+        delete_exam_paper,
+        get_enrolled_students_for_subject,
+        get_exam_papers_for_teacher,
+        get_paper_submissions_for_teacher,
+        get_teacher_subjects,
+        insert_paper_submission,
+        record_paper_evaluation_error,
+        remove_unreferenced_exam_files,
+        save_teacher_verified_marks,
+        update_exam_documents,
+        update_exam_marking_scheme,
+        update_paper_evaluation,
+    )
+    from src.components.exam_marking_config import (
+        exam_review_fingerprint,
+        render_marking_scheme_editor,
+        render_marking_scheme_summary,
+    )
+    from src.pipelines.exam_marking import (
+        calculate_exam_result,
+        get_scoring_targets,
+        target_scores_from_result,
+        validate_marking_scheme,
+    )
+    from src.pipelines.paper_pipeline import (
+        compress_uploaded_pages,
+        create_blueprint_rubric,
+        decode_storage_paths,
+        download_stored_pages,
+        encode_storage_paths,
+        evaluate_exam_pages,
+        extract_exam_rubric,
+        exam_storage_prefix,
+        upload_page_images,
+    )
+
+    logger = logging.getLogger(__name__)
+    teacher_id = st.session_state.teacher_data["teacher_id"]
+    st.header("Live Paper Check-In & AI Semantic Grading")
+    st.caption(
+        "Upload a blueprint answer key, map each answer sheet to an enrolled "
+        "student, then review and publish the AI-assisted scores."
+    )
+
+    subjects = get_teacher_subjects(teacher_id)
+    if not subjects:
+        st.info("Create a subject before setting up a paper evaluation.")
+        return
+    subject_options = {
+        f"{subject['name']} — {subject['subject_code']}": subject["subject_id"]
+        for subject in subjects
+    }
+    subject_label = st.selectbox(
+        "Subject",
+        list(subject_options),
+        key="paper_evaluation_subject",
+    )
+    subject_id = subject_options[subject_label]
+
+    from src.database.config import get_vision_api_key
+
+    if not get_vision_api_key():
+        st.warning(
+            "AI paper grading is not configured yet. Add your Gemini API key as "
+            "`GEMINI_API_KEY` in `.streamlit/secrets.toml` or as an environment "
+            "variable, then restart SmartAttend."
+        )
+
+    create_generation_key = f"paper_create_generation_{subject_id}"
+    create_generation = st.session_state.setdefault(create_generation_key, 0)
+    with st.expander("Create an exam and upload its blueprint", expanded=False):
+        exam_title = st.text_input(
+            "Exam title",
+            key=f"paper_title_{subject_id}_{create_generation}",
+        )
+        total_marks = st.number_input(
+            "Total examination marks",
+            min_value=1.0,
+            value=100.0,
+            step=1.0,
+            key=f"paper_total_marks_{subject_id}_{create_generation}",
+        )
+        blueprint_file = st.file_uploader(
+            "Blueprint answer key (image or PDF)",
+            type=["png", "jpg", "jpeg", "webp", "pdf"],
+            key=f"paper_blueprint_{subject_id}_{create_generation}",
+        )
+        question_paper_file = st.file_uploader(
+            "Question paper (image or PDF)",
+            type=["png", "jpg", "jpeg", "webp", "pdf"],
+            key=f"paper_question_{subject_id}_{create_generation}",
+        )
+        marking_scheme, marking_generation_key = render_marking_scheme_editor(
+            total_marks,
+            f"paper_create_{subject_id}",
+        )
+        pending_key = f"exam_scheme_pending_{subject_id}"
+        try:
+            current_fingerprint = exam_review_fingerprint(
+                exam_title,
+                total_marks,
+                marking_scheme,
+                blueprint_file,
+                question_paper_file,
+            )
+        except Exception as error:
+            current_fingerprint = None
+            st.error(f"Could not read the selected exam documents: {error}")
+        pending_review = st.session_state.get(pending_key)
+        if (
+            pending_review
+            and pending_review.get("fingerprint") != current_fingerprint
+        ):
+            st.session_state.pop(pending_key, None)
+            pending_review = None
+            st.info("The exam configuration changed. Review it again to continue.")
+
+        if st.button(
+            "Review marks distribution and documents",
+            key=f"review_exam_scheme_{subject_id}_{create_generation}",
+            type="primary",
+            width="stretch",
+        ):
+            try:
+                if not exam_title.strip():
+                    raise ValueError("Enter an exam title before reviewing.")
+                if blueprint_file is None or question_paper_file is None:
+                    raise ValueError(
+                        "Upload both the blueprint and question paper."
+                    )
+                validate_marking_scheme(marking_scheme, total_marks)
+                with st.spinner(
+                    "Checking the configured scheme against the blueprint "
+                    "and question paper..."
+                ):
+                    blueprint_pages = compress_uploaded_pages(blueprint_file)
+                    question_paper_pages = compress_uploaded_pages(
+                        question_paper_file
+                    )
+                    checked_scheme, report = extract_exam_rubric(
+                        blueprint_pages,
+                        question_paper_pages,
+                        marking_scheme,
+                    )
+                st.session_state[pending_key] = {
+                    "fingerprint": exam_review_fingerprint(
+                        exam_title,
+                        total_marks,
+                        marking_scheme,
+                        blueprint_file,
+                        question_paper_file,
+                    ),
+                    "title": exam_title.strip(),
+                    "total_marks": total_marks,
+                    "marking_scheme": checked_scheme,
+                    "report": report,
+                    "blueprint_pages": blueprint_pages,
+                    "question_paper_pages": question_paper_pages,
+                }
+                st.rerun()
+            except Exception as error:
+                logger.exception("Could not review the exam marking scheme")
+                st.error(f"Could not review this exam: {error}")
+
+        pending_review = st.session_state.get(pending_key)
+        if pending_review and pending_review.get("fingerprint") == current_fingerprint:
+            report = pending_review["report"]
+            st.subheader("Review and confirm this examination")
+            render_marking_scheme_summary(
+                pending_review["marking_scheme"],
+                pending_review["total_marks"],
+            )
+            st.markdown("**Document comparison**")
+            for module in report["modules"]:
+                st.caption(
+                    f"{module['module']}: configured "
+                    f"{module['configured_marks']:g}; blueprint "
+                    f"{module['blueprint_marks'] if module['blueprint_marks'] is not None else 'unclear'}; "
+                    f"question paper "
+                    f"{module['question_paper_marks'] if module['question_paper_marks'] is not None else 'unclear'}"
+                )
+            for item in report["items"]:
+                st.caption(
+                    f"{item['question_no']}: configured "
+                    f"{item['configured_marks']:g}; blueprint "
+                    f"{item['blueprint_marks'] if item['blueprint_marks'] is not None else 'unclear'}; "
+                    f"question paper "
+                    f"{item['question_paper_marks'] if item['question_paper_marks'] is not None else 'unclear'}"
+                )
+            if report["missing_rubric"]:
+                st.error(
+                    "Expected answer concepts are missing for: "
+                    + ", ".join(report["missing_rubric"])
+                    + ". Enter the concepts in the configuration above, then "
+                    "review again."
+                )
+            if report["mark_mismatches"] or report["module_mismatches"]:
+                st.error(
+                    "The document marks do not match the configured scheme. "
+                    "Update the marks or documents and review again."
+                )
+            if report["unconfigured_questions"] or report["unconfigured_modules"]:
+                unmatched = (
+                    report["unconfigured_modules"]
+                    + report["unconfigured_questions"]
+                )
+                st.error(
+                    "The documents contain items not in the configured scheme: "
+                    + ", ".join(unmatched)
+                    + ". Add them or correct the uploaded documents."
+                )
+            unclear_marks = any(
+                item["blueprint_marks"] is None
+                or item["question_paper_marks"] is None
+                for item in report["items"] + report["modules"]
+            )
+            marks_confirmed = True
+            if unclear_marks:
+                marks_confirmed = st.checkbox(
+                    "I verified the configured marks where the documents do "
+                    "not show a clear allocation.",
+                    key=f"confirm_unclear_marks_{subject_id}_{current_fingerprint}",
+                )
+            ready_to_create = (
+                not report["missing_rubric"]
+                and not report["mark_mismatches"]
+                and not report["module_mismatches"]
+                and not report["unconfigured_questions"]
+                and not report["unconfigured_modules"]
+                and marks_confirmed
+            )
+            if st.button(
+                "Confirm scheme and create exam",
+                key=f"confirm_exam_scheme_{subject_id}_{current_fingerprint}",
+                type="primary",
+                disabled=not ready_to_create,
+            ):
+                exam = None
+                uploaded_paths = []
+                documents_saved = False
+                approved_scheme = pending_review["marking_scheme"]
+                targets = get_scoring_targets(approved_scheme)
+                rubric = {
+                    "questions": [
+                        {
+                            "question_no": target["question_no"],
+                            "max_marks": target["max_marks"],
+                            "checkpoints": target["checkpoints"],
+                            "target_id": target["target_id"],
+                        }
+                        for target in targets
+                    ]
+                }
+                try:
+                    exam = create_exam_paper(
+                        subject_id,
+                        teacher_id,
+                        pending_review["title"],
+                        None,
+                        rubric,
+                        pending_review["total_marks"],
+                        None,
+                        marking_scheme=approved_scheme,
+                    )
+                    blueprint_paths = upload_page_images(
+                        pending_review["blueprint_pages"],
+                        exam_storage_prefix(exam["exam_id"], "blueprints"),
+                    )
+                    uploaded_paths.extend(blueprint_paths)
+                    question_paper_paths = upload_page_images(
+                        pending_review["question_paper_pages"],
+                        exam_storage_prefix(exam["exam_id"], "question-papers"),
+                    )
+                    uploaded_paths.extend(question_paper_paths)
+                    update_exam_documents(
+                        exam["exam_id"],
+                        teacher_id,
+                        encode_storage_paths(blueprint_paths),
+                        blueprint_rubric=rubric,
+                        max_marks=pending_review["total_marks"],
+                        question_paper_path=encode_storage_paths(
+                            question_paper_paths
+                        ),
+                        marking_scheme=approved_scheme,
+                    )
+                    documents_saved = True
+                except Exception as error:
+                    logger.exception("Could not create a paper evaluation exam")
+                    cleanup_errors = []
+                    if exam is not None:
+                        try:
+                            delete_exam_paper(exam["exam_id"], teacher_id)
+                        except Exception as cleanup_error:
+                            logger.exception("Could not remove incomplete exam")
+                            cleanup_errors.append(str(cleanup_error))
+                    if uploaded_paths and not documents_saved:
+                        try:
+                            remove_unreferenced_exam_files(uploaded_paths)
+                        except Exception as cleanup_error:
+                            logger.exception("Could not clean up new exam files")
+                            cleanup_errors.append(str(cleanup_error))
+                    detail = f"Could not create this exam: {error}"
+                    if cleanup_errors:
+                        detail += (
+                            " Cleanup also failed: " + "; ".join(cleanup_errors)
+                        )
+                    st.error(detail)
+                else:
+                    st.session_state.pop(pending_key, None)
+                    st.session_state[create_generation_key] += 1
+                    st.session_state[marking_generation_key] += 1
+                    st.success("The confirmed exam and marking scheme were created.")
+                    st.rerun()
+
+    exams = get_exam_papers_for_teacher(teacher_id)
+    exams = [exam for exam in exams if exam["subject_id"] == subject_id]
+    if not exams:
+        st.info("Create an exam for this subject to start receiving answer sheets.")
+        return
+
+    exam_labels = {
+        exam["exam_id"]: (
+            f"{exam['title']} · {(exam.get('subjects') or {}).get('name', 'Subject')} "
+            f"· {exam['created_at'][:10]} · Exam {exam['exam_id']}"
+        )
+        for exam in exams
+    }
+    exams_by_id = {exam["exam_id"]: exam for exam in exams}
+    exam_label = st.selectbox(
+        "Exam",
+        list(exams_by_id),
+        format_func=lambda exam_id: exam_labels[exam_id],
+        key=f"paper_exam_selector_{subject_id}",
+    )
+    exam = exams_by_id[exam_label]
+
+    if st.button(
+        "Delete exam",
+        key=f"delete_exam_{exam['exam_id']}",
+        type="secondary",
+        icon=":material/delete:",
+    ):
+        st.session_state[f"confirm_delete_exam_{exam['exam_id']}"] = True
+    if st.session_state.get(f"confirm_delete_exam_{exam['exam_id']}"):
+        st.warning(
+            f"Delete '{exam['title']}' permanently? This removes the exam, "
+            "rubric, question paper, all submitted answer sheets, scores, "
+            "and reviews. This cannot be undone."
+        )
+        confirm_col, cancel_col = st.columns(2)
+        with confirm_col:
+            if st.button(
+                "Yes, permanently delete",
+                key=f"confirm_delete_exam_yes_{exam['exam_id']}",
+                type="primary",
+            ):
+                try:
+                    with st.spinner("Deleting exam and all related records..."):
+                        delete_exam_paper(exam["exam_id"], teacher_id)
+                except Exception as error:
+                    st.error(f"Could not fully delete this exam: {error}")
+                else:
+                    st.session_state.pop(
+                        f"confirm_delete_exam_{exam['exam_id']}",
+                        None,
+                    )
+                    st.success("The exam and its related records were deleted.")
+                    st.rerun()
+        with cancel_col:
+            if st.button(
+                "Cancel",
+                key=f"confirm_delete_exam_cancel_{exam['exam_id']}",
+            ):
+                st.session_state.pop(
+                    f"confirm_delete_exam_{exam['exam_id']}",
+                    None,
+                )
+                st.rerun()
+
+    blueprint_path = exam.get("blueprint_path")
+    if blueprint_path:
+        with st.expander("View blueprint"):
+            try:
+                blueprint_pages = download_stored_pages(
+                    decode_storage_paths(blueprint_path)
+                )
+                for page_index, blueprint_page in enumerate(
+                    blueprint_pages, start=1
+                ):
+                    st.image(blueprint_page, caption=f"Blueprint page {page_index}")
+            except Exception as error:
+                st.warning(f"The stored blueprint could not be displayed: {error}")
+
+    question_paper_path = exam.get("question_paper_path")
+    if question_paper_path:
+        with st.expander("View question paper"):
+            try:
+                question_pages = download_stored_pages(
+                    decode_storage_paths(question_paper_path)
+                )
+                for page_index, question_page in enumerate(
+                    question_pages, start=1
+                ):
+                    st.image(question_page, caption=f"Question paper page {page_index}")
+            except Exception as error:
+                st.warning(
+                    f"The stored question paper could not be displayed: {error}"
+                )
+
+    document_generation_key = f"paper_document_generation_{exam['exam_id']}"
+    document_generation = st.session_state.setdefault(document_generation_key, 0)
+    has_configured_marking_scheme = bool(
+        (exam.get("marking_scheme") or {}).get("modules")
+    )
+    with st.expander("Update exam documents"):
+        with st.form(
+            f"update_exam_documents_{exam['exam_id']}_{document_generation}"
+        ):
+            new_blueprint_file = st.file_uploader(
+                "Replace blueprint answer key (optional)",
+                type=["png", "jpg", "jpeg", "webp", "pdf"],
+                key=(
+                    f"update_blueprint_{exam['exam_id']}_"
+                    f"{document_generation}"
+                ),
+            )
+            updated_total_marks = st.number_input(
+                (
+                    "Total marks (controlled by the marking scheme)"
+                    if has_configured_marking_scheme
+                    else "Total marks (used when replacing the blueprint)"
+                ),
+                min_value=1.0,
+                value=float(exam["max_marks"]),
+                step=1.0,
+                disabled=has_configured_marking_scheme,
+                key=(
+                    f"update_total_marks_{exam['exam_id']}_"
+                    f"{document_generation}"
+                ),
+            )
+            new_question_paper_file = st.file_uploader(
+                "Replace question paper (optional)",
+                type=["png", "jpg", "jpeg", "webp", "pdf"],
+                key=(
+                    f"update_question_{exam['exam_id']}_"
+                    f"{document_generation}"
+                ),
+            )
+            clear_question_paper = st.checkbox(
+                "Remove the current question paper",
+                key=(
+                    f"clear_question_paper_{exam['exam_id']}_"
+                    f"{document_generation}"
+                ),
+            )
+            confirm_unclear_document_marks = st.checkbox(
+                "I reviewed the replacement documents and confirm the configured "
+                "marks wherever a document is unclear.",
+                key=(
+                    f"confirm_document_marks_{exam['exam_id']}_"
+                    f"{document_generation}"
+                ),
+            )
+            update_documents = st.form_submit_button(
+                "Save document changes",
+                type="primary",
+            )
+        if update_documents:
+            if (
+                new_blueprint_file is None
+                and new_question_paper_file is None
+                and not clear_question_paper
+            ):
+                st.warning("Choose at least one document change.")
+            elif clear_question_paper and new_question_paper_file is not None:
+                st.error(
+                    "Upload a replacement or remove the current question paper, "
+                    "not both."
+                )
+            else:
+                uploaded_paths = []
+                try:
+                    new_rubric = None
+                    new_blueprint_path = None
+                    new_marking_scheme = None
+                    question_pages = None
+                    blueprint_pages = None
+                    if new_question_paper_file is not None:
+                        question_pages = compress_uploaded_pages(
+                            new_question_paper_file
+                        )
+                    if new_blueprint_file is not None:
+                        blueprint_pages = compress_uploaded_pages(
+                            new_blueprint_file
+                        )
+                    new_marking_scheme = exam.get("marking_scheme") or {}
+                    if new_marking_scheme.get("modules") and (
+                        new_blueprint_file is not None
+                        or new_question_paper_file is not None
+                    ):
+                        if blueprint_pages is None:
+                            blueprint_pages = download_stored_pages(
+                                decode_storage_paths(exam.get("blueprint_path"))
+                            )
+                        if question_pages is None:
+                            question_pages = download_stored_pages(
+                                decode_storage_paths(
+                                    exam.get("question_paper_path")
+                                )
+                            )
+                        new_marking_scheme, report = extract_exam_rubric(
+                            blueprint_pages,
+                            question_pages,
+                            new_marking_scheme,
+                        )
+                        unclear_marks = any(
+                            item["blueprint_marks"] is None
+                            or item["question_paper_marks"] is None
+                            for item in report["items"] + report["modules"]
+                        )
+                        if (
+                            report["missing_rubric"]
+                            or report["mark_mismatches"]
+                            or report["module_mismatches"]
+                            or report["unconfigured_questions"]
+                            or report["unconfigured_modules"]
+                            or (
+                                unclear_marks
+                                and not confirm_unclear_document_marks
+                            )
+                        ):
+                            raise ValueError(
+                                "The replacement documents do not clearly "
+                                "match this exam's marking scheme, or unclear "
+                                "marks have not been confirmed."
+                            )
+                        if new_blueprint_file is not None:
+                            new_rubric = {
+                                "questions": [
+                                    {
+                                        "question_no": target["question_no"],
+                                        "max_marks": target["max_marks"],
+                                        "checkpoints": target["checkpoints"],
+                                        "target_id": target["target_id"],
+                                    }
+                                    for target in get_scoring_targets(
+                                        new_marking_scheme
+                                    )
+                                ]
+                            }
+                    elif new_blueprint_file is not None:
+                        new_rubric = create_blueprint_rubric(
+                            blueprint_pages,
+                            updated_total_marks,
+                        )
+                    if new_blueprint_file is not None:
+                        blueprint_paths = upload_page_images(
+                            blueprint_pages,
+                            exam_storage_prefix(exam["exam_id"], "blueprints"),
+                        )
+                        uploaded_paths.extend(blueprint_paths)
+                        new_blueprint_path = encode_storage_paths(blueprint_paths)
+
+                    new_question_paper_path = None
+                    if new_question_paper_file is not None:
+                        question_paths = upload_page_images(
+                            question_pages,
+                            exam_storage_prefix(
+                                exam["exam_id"],
+                                "question-papers",
+                            ),
+                        )
+                        uploaded_paths.extend(question_paths)
+                        new_question_paper_path = encode_storage_paths(
+                            question_paths
+                        )
+
+                    updated_exam = update_exam_documents(
+                        exam["exam_id"],
+                        teacher_id,
+                        blueprint_path=new_blueprint_path,
+                        blueprint_rubric=new_rubric,
+                        max_marks=(
+                            (
+                                exam["max_marks"]
+                                if has_configured_marking_scheme
+                                else updated_total_marks
+                            )
+                            if new_blueprint_path is not None
+                            else None
+                        ),
+                        question_paper_path=new_question_paper_path,
+                        clear_question_paper=clear_question_paper,
+                        marking_scheme=(
+                            new_marking_scheme
+                            if new_marking_scheme and new_marking_scheme.get("modules")
+                            else None
+                        ),
+                    )
+                except Exception as error:
+                    logger.exception(
+                        "Could not update documents for exam %s",
+                        exam["exam_id"],
+                    )
+                    cleanup_errors = []
+                    if uploaded_paths:
+                        try:
+                            remove_unreferenced_exam_files(uploaded_paths)
+                        except Exception as cleanup_error:
+                            logger.exception(
+                                "Could not clean up uncommitted exam files"
+                            )
+                            cleanup_errors.append(str(cleanup_error))
+                    detail = f"Could not update exam documents: {error}"
+                    if cleanup_errors:
+                        detail += (
+                            " Cleanup also failed: " + "; ".join(cleanup_errors)
+                        )
+                    st.error(detail)
+                else:
+                    old_paths = set()
+                    if new_blueprint_path is not None:
+                        old_paths.update(
+                            decode_storage_paths(exam.get("blueprint_path"))
+                        )
+                    if (
+                        new_question_paper_path is not None
+                        or clear_question_paper
+                    ):
+                        old_paths.update(
+                            decode_storage_paths(exam.get("question_paper_path"))
+                        )
+                    try:
+                        remove_unreferenced_exam_files(old_paths)
+                    except Exception as error:
+                        st.warning(
+                            "Documents were updated, but old files could not be "
+                            f"fully removed from storage: {error}"
+                        )
+                    st.session_state[document_generation_key] += 1
+                    st.success(
+                        f"Documents for {updated_exam['title']} were updated."
+                    )
+                    st.rerun()
+
+    marking_scheme = exam.get("marking_scheme") or {}
+    if marking_scheme.get("modules"):
+        edit_namespace = f"paper_edit_{exam['exam_id']}"
+        with st.expander(
+            "Edit marking scheme (available before any submissions)",
+            expanded=False,
+        ):
+            updated_total_marks = st.number_input(
+                "Updated total examination marks",
+                min_value=1.0,
+                value=float(exam["max_marks"]),
+                step=1.0,
+                key=f"edit_exam_total_marks_{exam['exam_id']}",
+            )
+            edited_scheme, _ = render_marking_scheme_editor(
+                updated_total_marks,
+                edit_namespace,
+                initial_scheme=marking_scheme,
+            )
+            marks_confirmed = st.checkbox(
+                "I reviewed the updated marks against this exam's documents.",
+                key=f"confirm_edit_exam_scheme_{exam['exam_id']}",
+            )
+            if st.button(
+                "Validate and save marking scheme",
+                key=f"save_exam_scheme_{exam['exam_id']}",
+                type="primary",
+                disabled=not marks_confirmed,
+            ):
+                try:
+                    validate_marking_scheme(
+                        edited_scheme,
+                        updated_total_marks,
+                    )
+                    blueprint_pages = download_stored_pages(
+                        decode_storage_paths(exam["blueprint_path"])
+                    )
+                    question_pages = download_stored_pages(
+                        decode_storage_paths(exam["question_paper_path"])
+                    )
+                    checked_scheme, report = extract_exam_rubric(
+                        blueprint_pages,
+                        question_pages,
+                        edited_scheme,
+                    )
+                    if (
+                        report["missing_rubric"]
+                        or report["mark_mismatches"]
+                        or report["module_mismatches"]
+                        or report["unconfigured_questions"]
+                        or report["unconfigured_modules"]
+                    ):
+                        raise ValueError(
+                            "The updated scheme does not match the readable "
+                            "question/blueprint structure. Correct the structure "
+                            "or expected concepts and try again."
+                        )
+                    rubric = {
+                        "questions": [
+                            {
+                                "question_no": target["question_no"],
+                                "max_marks": target["max_marks"],
+                                "checkpoints": target["checkpoints"],
+                                "target_id": target["target_id"],
+                            }
+                            for target in get_scoring_targets(checked_scheme)
+                        ]
+                    }
+                    with st.spinner("Saving this exam's marking scheme..."):
+                        update_exam_marking_scheme(
+                            exam["exam_id"],
+                            teacher_id,
+                            checked_scheme,
+                            updated_total_marks,
+                            rubric,
+                        )
+                except Exception as error:
+                    st.error(f"Could not update the marking scheme: {error}")
+                else:
+                    st.session_state[
+                        f"{edit_namespace}_marking_generation"
+                    ] += 1
+                    st.success("This exam's marking scheme was updated.")
+                    st.rerun()
+
+    st.subheader("Upload student answer sheets")
+    try:
+        enrolled_students = get_enrolled_students_for_subject(
+            exam["subject_id"], teacher_id
+        )
+    except Exception as error:
+        st.error(f"Could not load the enrolled students: {error}")
+        return
+    if not enrolled_students:
+        st.info("No students are enrolled in this exam's subject.")
+    else:
+        student_names = {
+            student["student_id"]: student["name"]
+            for student in enrolled_students
+        }
+        student_ids = [None] + list(student_names)
+        student_files = st.file_uploader(
+            "Student answer sheets (image or PDF)",
+            type=["png", "jpg", "jpeg", "webp", "pdf"],
+            accept_multiple_files=True,
+            key=f"paper_sheets_{exam['exam_id']}",
+        )
+        student_mapping = {}
+        for index, uploaded_file in enumerate(student_files or []):
+            student_mapping[index] = st.selectbox(
+                f"Student for {uploaded_file.name}",
+                student_ids,
+                format_func=lambda student_id: (
+                    "Choose a student" if student_id is None
+                    else student_names[student_id]
+                ),
+                key=f"paper_student_{exam['exam_id']}_{index}",
+            )
+        valid_mapping = (
+            student_files
+            and all(student_mapping.get(index) is not None for index in range(len(student_files)))
+            and len(set(student_mapping.values())) == len(student_mapping)
+        )
+        if student_files and not valid_mapping:
+            st.warning("Choose a different enrolled student for each answer sheet.")
+        if st.button(
+            "Evaluate answer sheets",
+            type="primary",
+            disabled=not valid_mapping,
+            key=f"evaluate_papers_{exam['exam_id']}",
+        ):
+            progress = st.progress(0, text="Preparing AI evaluation...")
+            errors = []
+            total_files = len(student_files)
+            for index, uploaded_file in enumerate(student_files):
+                progress.progress(
+                    index / total_files,
+                    text=f"Evaluating {uploaded_file.name} ({index + 1}/{total_files})...",
+                )
+                submission = None
+                try:
+                    pages = compress_uploaded_pages(uploaded_file)
+                    sheet_paths = upload_page_images(
+                        pages,
+                        exam_storage_prefix(exam["exam_id"], "submissions"),
+                    )
+                    submission = insert_paper_submission(
+                        exam["exam_id"],
+                        teacher_id,
+                        student_mapping[index],
+                        encode_storage_paths(sheet_paths),
+                    )
+                    ai_marks, evaluation_result = evaluate_exam_pages(
+                        exam,
+                        pages,
+                    )
+                    update_paper_evaluation(
+                        submission["submission_id"],
+                        exam["exam_id"],
+                        teacher_id,
+                        ai_marks,
+                        evaluation_result,
+                    )
+                except Exception as error:
+                    logger.exception(
+                        "Could not evaluate answer sheet %s", uploaded_file.name
+                    )
+                    if submission is not None:
+                        try:
+                            record_paper_evaluation_error(
+                                submission["submission_id"],
+                                exam["exam_id"],
+                                teacher_id,
+                                error,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Could not persist the paper evaluation error"
+                            )
+                    errors.append(f"{uploaded_file.name}: {error}")
+                progress.progress(
+                    (index + 1) / total_files,
+                    text=f"Completed {index + 1} of {total_files} answer sheets.",
+                )
+            if errors:
+                st.warning("Some answer sheets could not be evaluated:")
+                for error in errors:
+                    st.error(error)
+            else:
+                st.success(f"Evaluated {total_files} answer sheet(s).")
+
+    st.divider()
+    st.subheader("Teacher review & audit")
+    try:
+        submissions = get_paper_submissions_for_teacher(
+            exam["exam_id"], teacher_id
+        )
+    except Exception as error:
+        st.error(f"Could not load paper submissions: {error}")
+        return
+    if not submissions:
+        st.info("No answer sheets have been submitted for this exam yet.")
+        return
+
+    for submission in submissions:
+        student = submission.get("students") or {}
+        status = submission["status"]
+        with st.container(border=True):
+            st.write(
+                f"**{student.get('name', 'Student')}** · "
+                f"Student ID #ST-{submission.get('student_id', 'unknown')} · "
+                f"{status.capitalize()}"
+            )
+            st.caption(
+                f"Uploaded {submission['created_at']} · "
+                f"AI score: {submission.get('ai_marks', 'Not evaluated')} / "
+                f"{exam['max_marks']}"
+            )
+            student_answers = submission.get("student_answers")
+            if student_answers:
+                answers = student_answers.get("answers", {})
+                with st.expander("View student's submitted answers"):
+                    for module in (exam.get("marking_scheme") or {}).get(
+                        "modules",
+                        [],
+                    ):
+                        st.markdown(
+                            f"**{module['name']} — {module['max_marks']} marks**"
+                        )
+                        for question in module["questions"]:
+                            group_id = question.get("or_group_id")
+                            if group_id:
+                                question_targets = question.get(
+                                    "subquestions",
+                                    [],
+                                ) or [question]
+                                answer_ids = [
+                                    target.get("subquestion_id")
+                                    or target.get("question_id")
+                                    for target in question_targets
+                                ]
+                                attempted = any(
+                                    str(answers.get(answer_id, "")).strip()
+                                    for answer_id in answer_ids
+                                )
+                                st.caption(
+                                    f"{question['label']} — "
+                                    f"{'attempted' if attempted else 'not attempted'}"
+                                )
+                            targets = question.get("subquestions", [])
+                            if targets:
+                                for subquestion in targets:
+                                    st.write(
+                                        f"**{subquestion['label']}**: "
+                                        f"{answers.get(subquestion['subquestion_id'], '')}"
+                                    )
+                            else:
+                                st.write(
+                                    f"**{question['label']}**: "
+                                    f"{answers.get(question['question_id'], '')}"
+                                )
+            elif submission.get("sheet_path"):
+                try:
+                    image_pages = download_stored_pages(
+                        decode_storage_paths(submission["sheet_path"])
+                    )
+                    with st.expander("View uploaded answer sheet"):
+                        for page_index, image_page in enumerate(image_pages, start=1):
+                            st.image(image_page, caption=f"Page {page_index}")
+                except Exception as error:
+                    st.warning(
+                        f"The stored answer sheet could not be displayed: {error}"
+                    )
+
+            details = submission.get("evaluation_details") or []
+            if isinstance(details, dict) and "modules" in details:
+                marking_scheme = exam.get("marking_scheme") or {}
+                revised_scores = target_scores_from_result(details)
+                for module_result in details["modules"]:
+                    st.markdown(
+                        f"### {module_result['name']} · "
+                        f"{module_result['awarded_marks']} / "
+                        f"{module_result['max_marks']}"
+                    )
+                    for group in module_result.get("or_groups", []):
+                        selected_labels = [
+                            alternative["question_no"]
+                            for alternative in group["selected_alternatives"]
+                        ]
+                        selected_text = (
+                            ", ".join(selected_labels)
+                            if selected_labels
+                            else "None (no alternative attempted)"
+                        )
+                        st.info(
+                            f"OR group {group['label']} · Final selected "
+                            f"alternative(s): {selected_text} · Official marks "
+                            f"awarded: {group['awarded_marks']} / "
+                            f"{group['max_marks'] * group['allowed_attempts']:g}"
+                        )
+                    for question in module_result["questions"]:
+                        counted = (
+                            " · counted"
+                            if question.get("counted_for_score")
+                            else " · not counted"
+                            if question.get("or_group_id")
+                            else ""
+                        )
+                        st.markdown(
+                            f"**{question['question_no']}** · "
+                            f"{question['awarded_marks']} / "
+                            f"{question['max_marks']}{counted}"
+                        )
+                        scoring_items = question.get("subquestions", [])
+                        if not scoring_items:
+                            scoring_items = [{
+                                "target_id": question["question_id"],
+                                "question_no": question["question_no"],
+                                "max_marks": question["max_marks"],
+                                "awarded_marks": question["awarded_marks"],
+                                "semantic_match_pct": question.get(
+                                    "semantic_match_pct",
+                                    0,
+                                ),
+                                "feedback": question.get("feedback", ""),
+                            }]
+                        for item in scoring_items:
+                            st.caption(
+                                f"{item['question_no']} · "
+                                f"{item['awarded_marks']} / {item['max_marks']} "
+                                f"({item.get('semantic_match_pct', 0)}% match)"
+                            )
+                            st.caption(item.get("feedback", ""))
+                            if status == "evaluated":
+                                mark = st.number_input(
+                                    f"Override marks for {item['question_no']}",
+                                    min_value=0.0,
+                                    max_value=float(item["max_marks"]),
+                                    value=float(item["awarded_marks"]),
+                                    step=0.5,
+                                    key=(
+                                        f"paper_override_{submission['submission_id']}_"
+                                        f"{item['target_id']}"
+                                    ),
+                                )
+                                revised_scores[item["target_id"]][
+                                    "awarded_marks"
+                                ] = mark
+                revised_result = calculate_exam_result(
+                    marking_scheme,
+                    revised_scores,
+                )
+                if status == "evaluated":
+                    st.metric(
+                        "Proposed final score",
+                        f"{revised_result['final_marks']} / {exam['max_marks']}",
+                    )
+                    if st.button(
+                        "Verify & Publish",
+                        type="primary",
+                        key=f"verify_paper_{submission['submission_id']}",
+                    ):
+                        try:
+                            save_teacher_verified_marks(
+                                submission["submission_id"],
+                                exam["exam_id"],
+                                teacher_id,
+                                revised_result["final_marks"],
+                                revised_result,
+                            )
+                        except Exception as error:
+                            st.error(f"Could not publish this score: {error}")
+                        else:
+                            st.success(
+                                "Verified score published to the student portal."
+                            )
+                            st.rerun()
+                elif status == "verified":
+                    st.success(
+                        f"Published score: {submission.get('final_marks')} / "
+                        f"{exam['max_marks']} · reviewed "
+                        f"{submission.get('reviewed_at')}"
+                    )
+                continue
+            if isinstance(details, dict):
+                st.warning(details.get("error", "AI evaluation is pending."))
+                if status == "pending" and submission.get("sheet_path"):
+                    if st.button(
+                        "Retry AI evaluation",
+                        key=f"retry_paper_{submission['submission_id']}",
+                    ):
+                        try:
+                            retry_pages = download_stored_pages(
+                                decode_storage_paths(submission["sheet_path"])
+                            )
+                            if not retry_pages:
+                                raise ValueError(
+                                    "No stored answer-sheet pages were found. "
+                                    "Upload the sheet again to retry evaluation."
+                                )
+                            ai_marks, evaluation_result = evaluate_exam_pages(
+                                exam,
+                                retry_pages,
+                            )
+                            update_paper_evaluation(
+                                submission["submission_id"],
+                                exam["exam_id"],
+                                teacher_id,
+                                ai_marks,
+                                evaluation_result,
+                            )
+                        except Exception as error:
+                            logger.exception(
+                                "Could not retry answer sheet evaluation %s",
+                                submission["submission_id"],
+                            )
+                            try:
+                                record_paper_evaluation_error(
+                                    submission["submission_id"],
+                                    exam["exam_id"],
+                                    teacher_id,
+                                    error,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Could not persist the retry evaluation error"
+                                )
+                            st.error(f"Could not retry AI evaluation: {error}")
+                        else:
+                            st.success("Answer sheet evaluated successfully.")
+                            st.rerun()
+                continue
+            if details:
+                revised_details = []
+                mark_inputs = []
+                for question in details:
+                    st.markdown(
+                        f"**Question {question['question_no']}** · "
+                        f"{question['awarded_marks']} / {question['max_marks']} "
+                        f"({question['semantic_match_pct']}% semantic match)"
+                    )
+                    st.caption(question.get("feedback", ""))
+                    if status == "evaluated":
+                        mark = st.number_input(
+                            f"Override marks for question {question['question_no']}",
+                            min_value=0.0,
+                            max_value=float(question["max_marks"]),
+                            value=float(question["awarded_marks"]),
+                            step=0.5,
+                            key=(
+                                f"paper_override_{submission['submission_id']}_"
+                                f"{question['question_no']}"
+                            ),
+                        )
+                        mark_inputs.append(mark)
+                        revised_details.append({**question, "awarded_marks": mark})
+                    else:
+                        revised_details.append(question)
+                if status == "evaluated":
+                    final_marks = round(sum(mark_inputs), 2)
+                    st.metric("Proposed final score", f"{final_marks} / {exam['max_marks']}")
+                    if st.button(
+                        "Verify & Publish",
+                        type="primary",
+                        key=f"verify_paper_{submission['submission_id']}",
+                    ):
+                        try:
+                            save_teacher_verified_marks(
+                                submission["submission_id"],
+                                exam["exam_id"],
+                                teacher_id,
+                                final_marks,
+                                revised_details,
+                            )
+                        except Exception as error:
+                            st.error(f"Could not publish this score: {error}")
+                        else:
+                            st.success("Verified score published to the student portal.")
+                            st.rerun()
+                elif status == "verified":
+                    st.success(
+                        f"Published score: {submission.get('final_marks')} / "
+                        f"{exam['max_marks']} · reviewed {submission.get('reviewed_at')}"
+                    )
 
 
 def teacher_tab_live_sessions():

@@ -2,6 +2,7 @@ import importlib.util
 
 import streamlit as st
 
+from src.database.db import get_live_campus_session_count
 from src.ui.navigation import navigate_to
 
 
@@ -41,6 +42,7 @@ def home_screen():
     with location:
         with st.container(border=True):
             st.caption("Campus proximity")
+            st.session_state.setdefault("demo_campus_geofence", True)
             demo_in_radius = st.toggle(
                 "Demo location: in radius",
                 key="demo_campus_geofence",
@@ -92,13 +94,20 @@ def home_screen():
             ):
                 navigate_to("teacher")
 
+    live_sessions_count = get_live_campus_session_count()
+    teacher_data = st.session_state.get("teacher_data")
+    teacher_note = ""
+    if teacher_data and isinstance(teacher_data, dict) and "teacher_id" in teacher_data:
+        teacher_live_count = get_live_campus_session_count(teacher_data["teacher_id"])
+        teacher_note = f" ({teacher_live_count} in your classes)"
+
     with st.container(border=True):
         metric_column, description_column = st.columns([1, 4], vertical_alignment="center")
         with metric_column:
-            st.metric("42", "Live campus sessions")
+            st.metric("Live campus sessions", live_sessions_count)
         with description_column:
             st.markdown("**Campus operations snapshot**")
             st.caption(
-                "Illustrative campus-wide figure. This app displays live sessions "
-                "for the signed-in teacher, not a campus-wide aggregate."
+                "Real-time count of active class sessions currently open for "
+                f"attendance check-in across campus{teacher_note}."
             )

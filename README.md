@@ -7,11 +7,53 @@ Home, Student, Teacher, and Attendance Records views available, and the theme
 switch is stored for the current browser session. Students can use **Live Class
 Check-in** with the short-lived code from their teacher; teachers open and close
 those sessions from **Live Check-in**. Camera, microphone, and location access
-are requested only when the related flow is used. The campus count and optional
-geofence control on the home screen are explicitly illustrative; the application
-does not claim a campus-wide live-session count or configured campus boundary.
+are requested only when the related flow is used. The live session count on the
+home screen queries active sessions from the database in real time. The optional
+geofence control remains illustrative; the application does not configure a real
+campus boundary.
 Teachers can extend an active session by five minutes, rotate its access code,
 or close it to lock check-in.
+
+## Paper evaluation
+
+Install the packages in `requirements.txt`, set `GEMINI_API_KEY` in the
+environment or `.streamlit/secrets.toml`, and run `sql/paper_evaluation.sql`
+in the Supabase SQL Editor. The migration creates the exam/submission tables
+and a private `exam-sheets` storage bucket. In the Teacher Portal, each exam
+gets its own blueprint and question-paper files; selected exams can replace or
+remove their documents without affecting another exam. Exams can also be
+deleted with their submissions and unshared stored files. Map uploaded student
+sheets to enrolled students, then review the AI marks before selecting
+**Verify & Publish**. For new exams, configure the total, modules, questions,
+sub-questions, compulsory questions, and OR groups in the teacher marking
+editor. The application compares the configured marks with the blueprint and
+question paper and requires confirmation before creating the exam. Each exam's
+marking scheme is stored on its own exam record. Students can submit one online
+attempt per exam; the scheme identifies compulsory questions and OR groups.
+AI paper evaluation uses `gemini-3.5-flash-lite` by default. To override it,
+set `GEMINI_MODEL` in the environment or `.streamlit/secrets.toml`; if the
+configured model is unavailable, the evaluator tries supported fallbacks.
+Failed evaluations stay pending; after correcting the model setting and
+restarting SmartAttend, use **Retry AI evaluation** on the saved submission.
+Students may leave sub-questions unanswered and still receive partial credit
+for their other answers. Alternatives in an OR group must have equal question
+marks and matching sub-question counts and marks; the module maximum counts
+only the permitted choices, not every alternative. Each alternative is
+evaluated independently, and the highest-scoring permitted alternatives count
+toward the module total. Teachers review the hierarchical AI marks before
+publishing, and
+students see only verified scores and question feedback in **Exam Results**.
+Stored documents are converted to JPEG page images; PostgreSQL stores storage
+paths, rubric, marks, and feedback, not original file contents. The migration
+is rerunnable and updates existing exam records for document lifecycle
+management and online attempts.
+Install dependencies and launch Streamlit with the same Python environment.
+On Windows, for example:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
 
 ## Supabase setup
 

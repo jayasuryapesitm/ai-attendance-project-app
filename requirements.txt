@@ -18,7 +18,9 @@ bcrypt
 
 
 segno
-pillow
+pillow>=11.0.0
+PyMuPDF>=1.24.0
+google-genai>=1.0.0
 
 
 

@@ -1,4 +1,5 @@
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
@@ -454,6 +455,30 @@ def get_class_sessions_for_teacher(teacher_id):
     return sessions
 
 
+def get_live_campus_session_count(teacher_id=None):
+    """Return the number of active class sessions currently open across campus or for a teacher."""
+    try:
+        now_utc = datetime.now(timezone.utc).isoformat()
+        query = (
+            supabase.table("class_sessions")
+            .select("session_id", count="exact")
+            .is_("closed_at", "null")
+            .gt("expires_at", now_utc)
+        )
+        if teacher_id is not None:
+            query = query.eq("teacher_id", teacher_id)
+        response = query.execute()
+        if response.count is not None:
+            return response.count
+        return len(response.data or [])
+    except APIError:
+        logger.exception("Could not count live class sessions via APIError")
+        return 0
+    except (httpx.HTTPError, Exception):
+        logger.exception("Could not count live campus sessions")
+        return 0
+
+
 def submit_class_checkin(
     access_code,
     student_id,
@@ -526,3 +551,531 @@ def save_student_voice_profile(student_id, voice_embedding):
     if not response.data:
         raise ValueError('Could not save the voice profile for this student.')
     return response.data[0]
+
+
+def _get_owned_exam(exam_id, teacher_id):
+    response = (
+        supabase.table("exam_papers")
+        .select(
+            "exam_id, subject_id, title, max_marks, blueprint_path, "
+            "blueprint_rubric, question_paper_path, marking_scheme"
+        )
+        .eq("exam_id", exam_id)
+        .eq("teacher_id", teacher_id)
+        .execute()
+    )
+    if not response.data:
+        raise ValueError("This exam was not found in your subjects.")
+    return response.data[0]
+
+
+def get_enrolled_students_for_subject(subject_id, teacher_id):
+    subject = (
+        supabase.table("subjects")
+        .select("subject_id")
+        .eq("subject_id", subject_id)
+        .eq("teacher_id", teacher_id)
+        .execute()
+    )
+    if not subject.data:
+        raise ValueError("This subject was not found in your classes.")
+    response = (
+        supabase.table("subject_students")
+        .select("student_id, students(student_id, name)")
+        .eq("subject_id", subject_id)
+        .execute()
+    )
+    return [
+        {
+            "student_id": row["student_id"],
+            "name": (row.get("students") or {}).get("name", "Student"),
+        }
+        for row in response.data
+        if row.get("students")
+    ]
+
+
+def create_exam_paper(
+    subject_id,
+    teacher_id,
+    title,
+    blueprint_path,
+    blueprint_rubric,
+    max_marks,
+    question_paper_path=None,
+    marking_scheme=None,
+):
+    subject = (
+        supabase.table("subjects")
+        .select("subject_id")
+        .eq("subject_id", subject_id)
+        .eq("teacher_id", teacher_id)
+        .execute()
+    )
+    if not subject.data:
+        raise ValueError("This subject was not found in your classes.")
+    response = (
+        supabase.table("exam_papers")
+        .insert({
+            "subject_id": subject_id,
+            "teacher_id": teacher_id,
+            "title": title,
+            "blueprint_path": blueprint_path,
+            "blueprint_rubric": blueprint_rubric,
+            "max_marks": max_marks,
+            "question_paper_path": question_paper_path,
+            "marking_scheme": marking_scheme or {},
+        })
+        .select("*")
+        .execute()
+    )
+    return response.data[0]
+
+
+def get_exam_papers_for_teacher(teacher_id):
+    response = (
+        supabase.table("exam_papers")
+        .select("*, subjects(name, subject_code, section)")
+        .eq("teacher_id", teacher_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return response.data
+
+
+def get_available_exams_for_student(student_id):
+    subjects = get_student_subjects(student_id)
+    subject_ids = [
+        row["subjects"]["subject_id"]
+        for row in subjects
+        if row.get("subjects")
+    ]
+    if not subject_ids:
+        return []
+
+    exams = (
+        supabase.table("exam_papers")
+        .select("*, subjects(name, subject_code)")
+        .in_("subject_id", subject_ids)
+        .order("created_at", desc=True)
+        .execute()
+        .data
+    )
+    existing_attempts = (
+        supabase.table("paper_submissions")
+        .select("exam_id, student_answers")
+        .eq("student_id", student_id)
+        .execute()
+        .data
+    )
+    attempted_exam_ids = {
+        row["exam_id"]
+        for row in existing_attempts
+        if row.get("student_answers") is not None
+    }
+    return [
+        exam for exam in exams
+        if exam["exam_id"] not in attempted_exam_ids
+        and (exam.get("marking_scheme") or {}).get("modules")
+        and exam.get("question_paper_path")
+    ]
+
+
+def get_student_exam_attempts(student_id):
+    response = (
+        supabase.table("paper_submissions")
+        .select(
+            "*, exam_papers!inner(title, max_marks, marking_scheme, "
+            "question_paper_path, subjects(name, subject_code))"
+        )
+        .eq("student_id", student_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return [
+        row for row in response.data
+        if row.get("student_answers") is not None
+    ]
+
+
+def submit_student_exam_attempt(exam_id, student_id, answers, evaluation_result):
+    from src.pipelines.exam_marking import (
+        calculate_exam_result,
+        target_scores_from_result,
+        validate_marking_scheme,
+        validate_student_answers,
+    )
+
+    exam_response = (
+        supabase.table("exam_papers")
+        .select("exam_id, subject_id, marking_scheme, question_paper_path")
+        .eq("exam_id", exam_id)
+        .execute()
+    )
+    if not exam_response.data:
+        raise ValueError("This exam is no longer available.")
+    exam = exam_response.data[0]
+    if not exam.get("question_paper_path"):
+        raise ValueError("This exam does not have a question paper.")
+    if not (exam.get("marking_scheme") or {}).get("modules"):
+        raise ValueError("This exam does not have a student marking scheme.")
+    marking_scheme = exam["marking_scheme"]
+    validate_marking_scheme(marking_scheme, evaluation_result.get("max_marks"))
+    answers = validate_student_answers(marking_scheme, answers)
+    evaluation_result = calculate_exam_result(
+        marking_scheme,
+        target_scores_from_result(evaluation_result),
+    )
+
+    enrollment = (
+        supabase.table("subject_students")
+        .select("student_id")
+        .eq("subject_id", exam["subject_id"])
+        .eq("student_id", student_id)
+        .execute()
+    )
+    if not enrollment.data:
+        raise ValueError("You are not enrolled in this exam's subject.")
+
+    existing = (
+        supabase.table("paper_submissions")
+        .select("submission_id, student_answers")
+        .eq("exam_id", exam_id)
+        .eq("student_id", student_id)
+        .execute()
+        .data
+    )
+    if any(row.get("student_answers") is not None for row in existing):
+        raise ValueError("You have already submitted this exam.")
+    response = (
+        supabase.table("paper_submissions")
+        .insert({
+            "exam_id": exam_id,
+            "student_id": student_id,
+            "sheet_path": None,
+            "student_answers": answers,
+            "ai_marks": evaluation_result["final_marks"],
+            "evaluation_details": evaluation_result,
+            "status": "evaluated",
+        })
+        .select("*")
+        .execute()
+    )
+    if not response.data:
+        raise ValueError("Your exam attempt could not be saved.")
+    return response.data[0]
+
+
+def _decode_storage_paths(value):
+    from src.pipelines.paper_pipeline import decode_storage_paths
+
+    return [str(path) for path in decode_storage_paths(value) if path]
+
+
+def _get_all_storage_reference_rows(table_name, columns):
+    rows = []
+    page_size = 500
+    offset = 0
+    while True:
+        page = (
+            supabase.table(table_name)
+            .select(columns)
+            .range(offset, offset + page_size - 1)
+            .execute()
+            .data
+        )
+        rows.extend(page)
+        if len(page) < page_size:
+            return rows
+        offset += page_size
+
+
+def remove_unreferenced_exam_files(paths):
+    candidates = set(paths)
+    if not candidates:
+        return
+
+    exam_rows = _get_all_storage_reference_rows(
+        "exam_papers",
+        "blueprint_path, question_paper_path",
+    )
+    submission_rows = _get_all_storage_reference_rows(
+        "paper_submissions",
+        "sheet_path",
+    )
+    referenced = set()
+    for row in exam_rows:
+        referenced.update(_decode_storage_paths(row.get("blueprint_path")))
+        referenced.update(_decode_storage_paths(row.get("question_paper_path")))
+    for row in submission_rows:
+        referenced.update(_decode_storage_paths(row.get("sheet_path")))
+
+    unreferenced = sorted(candidates - referenced)
+    if unreferenced:
+        from src.pipelines.paper_pipeline import remove_stored_pages
+
+        try:
+            remove_stored_pages(unreferenced)
+        except Exception as error:
+            logger.exception("Could not remove unreferenced exam files")
+            raise RuntimeError(
+                "The database change succeeded, but one or more old files "
+                "could not be removed from storage."
+            ) from error
+
+
+def update_exam_documents(
+    exam_id,
+    teacher_id,
+    blueprint_path=None,
+    blueprint_rubric=None,
+    max_marks=None,
+    question_paper_path=None,
+    clear_question_paper=False,
+    marking_scheme=None,
+):
+    _get_owned_exam(exam_id, teacher_id)
+    updates = {}
+
+    if blueprint_path is not None:
+        if not blueprint_rubric or max_marks is None or max_marks <= 0:
+            raise ValueError("A new blueprint requires a valid grading rubric and total.")
+        updates.update({
+            "blueprint_path": blueprint_path,
+            "max_marks": max_marks,
+        })
+        if blueprint_rubric is not None:
+            updates["blueprint_rubric"] = blueprint_rubric
+    if marking_scheme is not None:
+        updates["marking_scheme"] = marking_scheme
+
+    if question_paper_path is not None:
+        updates["question_paper_path"] = question_paper_path
+    elif clear_question_paper:
+        updates["question_paper_path"] = None
+
+    if not updates:
+        raise ValueError("Choose a document to update.")
+
+    response = (
+        supabase.table("exam_papers")
+        .update(updates)
+        .eq("exam_id", exam_id)
+        .eq("teacher_id", teacher_id)
+        .select("*")
+        .execute()
+    )
+    if not response.data:
+        raise ValueError("The exam documents could not be updated.")
+
+    return response.data[0]
+
+
+def update_exam_marking_scheme(
+    exam_id,
+    teacher_id,
+    marking_scheme,
+    total_marks,
+    blueprint_rubric,
+):
+    from src.pipelines.exam_marking import validate_marking_scheme
+
+    _get_owned_exam(exam_id, teacher_id)
+    validate_marking_scheme(marking_scheme, total_marks)
+    submissions = (
+        supabase.table("paper_submissions")
+        .select("submission_id")
+        .eq("exam_id", exam_id)
+        .execute()
+        .data
+    )
+    if submissions:
+        raise ValueError(
+            "The marking scheme cannot be changed after student submissions "
+            "exist, because that would reinterpret recorded scores."
+        )
+    response = (
+        supabase.table("exam_papers")
+        .update({
+            "marking_scheme": marking_scheme,
+            "blueprint_rubric": blueprint_rubric,
+            "max_marks": total_marks,
+        })
+        .eq("exam_id", exam_id)
+        .eq("teacher_id", teacher_id)
+        .select("*")
+        .execute()
+    )
+    if not response.data:
+        raise ValueError("The exam marking scheme could not be updated.")
+    return response.data[0]
+
+
+def delete_exam_paper(exam_id, teacher_id):
+    exam = _get_owned_exam(exam_id, teacher_id)
+
+    submissions = (
+        supabase.table("paper_submissions")
+        .select("sheet_path")
+        .eq("exam_id", exam_id)
+        .execute()
+        .data
+    )
+
+    storage_paths = set()
+    for field in (
+        exam.get("blueprint_path"),
+        exam.get("question_paper_path"),
+    ):
+        storage_paths.update(_decode_storage_paths(field))
+    for submission in submissions:
+        storage_paths.update(
+            _decode_storage_paths(submission.get("sheet_path"))
+        )
+
+    response = supabase.rpc(
+        "delete_paper_exam",
+        {
+            "p_exam_id": exam_id,
+            "p_teacher_id": teacher_id,
+        },
+    ).execute()
+    if not response.data:
+        raise ValueError("The exam could not be deleted.")
+
+    remove_unreferenced_exam_files(storage_paths)
+
+
+def insert_paper_submission(exam_id, teacher_id, student_id, sheet_path):
+    exam = _get_owned_exam(exam_id, teacher_id)
+    enrollment = (
+        supabase.table("subject_students")
+        .select("student_id")
+        .eq("subject_id", exam["subject_id"])
+        .eq("student_id", student_id)
+        .execute()
+    )
+    if not enrollment.data:
+        raise ValueError("The selected student is not enrolled in this subject.")
+    response = (
+        supabase.table("paper_submissions")
+        .insert({
+            "exam_id": exam_id,
+            "student_id": student_id,
+            "sheet_path": sheet_path,
+            "status": "pending",
+        })
+        .select("*")
+        .execute()
+    )
+    return response.data[0]
+
+
+def update_paper_evaluation(submission_id, exam_id, teacher_id, ai_marks, details):
+    exam = _get_owned_exam(exam_id, teacher_id)
+    if ai_marks < 0 or ai_marks > float(exam["max_marks"]):
+        raise ValueError("The AI score must be within the exam's total marks.")
+    response = (
+        supabase.table("paper_submissions")
+        .update({
+            "ai_marks": ai_marks,
+            "evaluation_details": details,
+            "status": "evaluated",
+        })
+        .eq("submission_id", submission_id)
+        .eq("exam_id", exam_id)
+        .eq("status", "pending")
+        .select("*")
+        .execute()
+    )
+    if not response.data:
+        raise ValueError("This paper is no longer waiting for AI evaluation.")
+    return response.data[0]
+
+
+def get_paper_submissions_for_teacher(exam_id, teacher_id):
+    _get_owned_exam(exam_id, teacher_id)
+    response = (
+        supabase.table("paper_submissions")
+        .select("*, students(name)")
+        .eq("exam_id", exam_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return response.data
+
+
+def record_paper_evaluation_error(submission_id, exam_id, teacher_id, error):
+    _get_owned_exam(exam_id, teacher_id)
+    response = (
+        supabase.table("paper_submissions")
+        .update({"evaluation_details": {"error": str(error)}})
+        .eq("submission_id", submission_id)
+        .eq("exam_id", exam_id)
+        .eq("status", "pending")
+        .select("submission_id")
+        .execute()
+    )
+    if not response.data:
+        raise ValueError("Could not save the paper evaluation failure.")
+
+
+def save_teacher_verified_marks(
+    submission_id, exam_id, teacher_id, final_marks, evaluation_details
+):
+    exam = _get_owned_exam(exam_id, teacher_id)
+    if isinstance(evaluation_details, dict) and "modules" in evaluation_details:
+        from src.pipelines.exam_marking import (
+            calculate_exam_result,
+            target_scores_from_result,
+        )
+
+        evaluation_details = calculate_exam_result(
+            exam.get("marking_scheme") or {},
+            target_scores_from_result(evaluation_details),
+        )
+        if not math.isclose(
+            float(final_marks),
+            evaluation_details["final_marks"],
+            abs_tol=0.01,
+        ):
+            raise ValueError(
+                "The verified total must equal the capped module and "
+                "question scores."
+            )
+        final_marks = evaluation_details["final_marks"]
+    if final_marks < 0 or final_marks > float(exam["max_marks"]):
+        raise ValueError("The verified score must be within the exam's total marks.")
+    response = (
+        supabase.table("paper_submissions")
+        .update({
+            "final_marks": final_marks,
+            "evaluation_details": evaluation_details,
+            "status": "verified",
+            "reviewed_by": teacher_id,
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        })
+        .eq("submission_id", submission_id)
+        .eq("exam_id", exam_id)
+        .eq("status", "evaluated")
+        .select("*")
+        .execute()
+    )
+    if not response.data:
+        raise ValueError("This paper was already reviewed or is not evaluated.")
+    return response.data[0]
+
+
+def get_verified_paper_results(student_id):
+    response = (
+        supabase.table("paper_submissions")
+        .select(
+            "*, exam_papers!inner(title, max_marks, marking_scheme, "
+            "question_paper_path, subjects(name, subject_code))"
+        )
+        .eq("student_id", student_id)
+        .eq("status", "verified")
+        .order("reviewed_at", desc=True)
+        .execute()
+    )
+    return response.data
