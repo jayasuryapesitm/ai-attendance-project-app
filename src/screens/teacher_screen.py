@@ -224,7 +224,7 @@ def teacher_tab_take_attendance():
 
                 from src.components.dialog_attendance_results import attendance_result_dialog
                 from src.database.config import supabase
-                from src.pipelines.face_pipeline import predict_attendance
+                from src.pipelines.face_pipeline import predict_attendance_details
 
                 enrolled_res = (
                     supabase.table('subject_students')
@@ -247,22 +247,53 @@ def teacher_tab_take_attendance():
                 all_detected_ids = {}
                 total_faces_detected = 0
                 unmatched_faces = 0
+                recognized_observations = []
+                borderline_observations = []
+                unmatched_observations = []
 
                 for idx, img in enumerate(st.session_state.attendance_images):
                     img_np = np.array(img.convert('RGB'))
-                    detected, faces_detected, unmatched = predict_attendance(
+                    observations = predict_attendance_details(
                         img_np,
                         candidate_student_ids=candidate_student_ids,
                         expected_face_count=len(candidate_student_ids),
                     )
-                    total_faces_detected += faces_detected
-                    unmatched_faces += unmatched
-
-                    if detected:
-                        for sid in detected.keys():
-                            student_id = int(sid)
-
-                            all_detected_ids.setdefault(student_id, []).append(f"Photo {idx+1}")
+                    total_faces_detected += len(observations)
+                    for face_index, observation in enumerate(observations):
+                        student_id = observation.get("student_id")
+                        status = observation.get("status")
+                        label = {
+                            "recognized": "Recognized",
+                            "borderline": "Borderline",
+                            "no_match": "Unmatched",
+                        }.get(status, "Unmatched")
+                        row = {
+                            "Photo": idx + 1,
+                            "Face": face_index + 1,
+                            "Student ID": student_id,
+                            "Distance": observation.get("distance"),
+                            "Orientation": observation.get("orientation"),
+                            "Status": label,
+                            "Box": observation.get("box"),
+                            "Crop": (
+                                img_np[
+                                    max(0, observation["box"][1]):max(0, observation["box"][3]),
+                                    max(0, observation["box"][0]):max(0, observation["box"][2]),
+                                ]
+                                if observation.get("box")
+                                else None
+                            ),
+                        }
+                        if status == "recognized" and student_id is not None:
+                            if student_id not in all_detected_ids:
+                                all_detected_ids[student_id] = []
+                            all_detected_ids[student_id].append(f"Photo {idx+1}")
+                            recognized_observations.append(row)
+                        elif status == "borderline" and student_id is not None:
+                            borderline_observations.append(row)
+                        else:
+                            unmatched_faces += 1
+                            unmatched_observations.append(row)
 
                 results, attendance_to_log = [], []
                 current_timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -286,7 +317,7 @@ def teacher_tab_take_attendance():
                         'is_present': bool(is_present)
                     })
 
-                matched_faces = total_faces_detected - unmatched_faces
+                matched_faces = len(recognized_observations)
                 unrecognized_student_count = (
                     len(enrolled_students) - len(all_detected_ids)
                 )
@@ -307,7 +338,23 @@ def teacher_tab_take_attendance():
                         "face observations. Review the roster before saving."
                     )
 
-                attendance_result_dialog(pd.DataFrame(results), attendance_to_log)
+                attendance_result_dialog(
+                    pd.DataFrame(results),
+                    attendance_to_log,
+                    {
+                        "recognized": recognized_observations,
+                        "borderline": borderline_observations,
+                        "unmatched": unmatched_observations,
+                        "enrolled_not_detected": [
+                            {
+                                "Name": node["students"]["name"],
+                                "ID": node["students"]["student_id"],
+                            }
+                            for node in enrolled_students
+                            if int(node["students"]["student_id"]) not in all_detected_ids
+                        ],
+                    },
+                )
 
 def teacher_tab_manage_subjects():
     from src.database.db import get_teacher_subjects
@@ -1204,6 +1251,32 @@ def teacher_tab_paper_evaluation():
     except Exception as error:
         st.error(f"Could not load the enrolled students: {error}")
         return
+    try:
+        submissions = get_paper_submissions_for_teacher(
+            exam["exam_id"], teacher_id
+        )
+    except Exception as error:
+        st.error(f"Could not load paper submissions: {error}")
+        return
+    submitted_student_ids = {
+        submission["student_id"] for submission in submissions
+    }
+    upload_generation_key = f"paper_upload_generation_{exam['exam_id']}"
+    upload_generation = st.session_state.setdefault(upload_generation_key, 0)
+    upload_result_key = f"paper_upload_result_{exam['exam_id']}"
+
+    upload_result = st.session_state.pop(upload_result_key, None)
+    if upload_result:
+        errors = upload_result["errors"]
+        if errors:
+            st.warning("Some answer sheets could not be evaluated:")
+            for error in errors:
+                st.error(error)
+        else:
+            st.success(
+                f"Evaluated {upload_result['total_files']} answer sheet(s)."
+            )
+
     if not enrolled_students:
         st.info("No students are enrolled in this exam's subject.")
     else:
@@ -1211,12 +1284,54 @@ def teacher_tab_paper_evaluation():
             student["student_id"]: student["name"]
             for student in enrolled_students
         }
-        student_ids = [None] + list(student_names)
+        submission_counts = {}
+        for submission in submissions:
+            student_id = submission["student_id"]
+            submission_counts[student_id] = (
+                submission_counts.get(student_id, 0) + 1
+            )
+        duplicate_student_ids = {
+            student_id
+            for student_id, count in submission_counts.items()
+            if count > 1
+        }
+        duplicate_names = sorted({
+            student_names[student_id]
+            for student_id in duplicate_student_ids
+            if student_id in student_names
+        })
+        if duplicate_names:
+            st.warning(
+                "Existing duplicate submissions are preserved for review. "
+                "New uploads are blocked for: "
+                + ", ".join(duplicate_names)
+                + "."
+            )
+        already_submitted_names = sorted({
+            student_names[student_id]
+            for student_id in submitted_student_ids
+            if student_id in student_names
+        })
+        if already_submitted_names:
+            st.info(
+                "A submission already exists for: "
+                + ", ".join(already_submitted_names)
+                + ". Each student may have only one submission per exam."
+            )
+        available_student_ids = [
+            student_id
+            for student_id in student_names
+            if student_id not in submitted_student_ids
+        ]
+        student_ids = [None] + available_student_ids
         student_files = st.file_uploader(
             "Student answer sheets (image or PDF)",
             type=["png", "jpg", "jpeg", "webp", "pdf"],
             accept_multiple_files=True,
-            key=f"paper_sheets_{exam['exam_id']}",
+            key=(
+                f"paper_sheets_{exam['exam_id']}_"
+                f"{upload_generation}"
+            ),
         )
         student_mapping = {}
         for index, uploaded_file in enumerate(student_files or []):
@@ -1227,7 +1342,10 @@ def teacher_tab_paper_evaluation():
                     "Choose a student" if student_id is None
                     else student_names[student_id]
                 ),
-                key=f"paper_student_{exam['exam_id']}_{index}",
+                key=(
+                    f"paper_student_{exam['exam_id']}_"
+                    f"{upload_generation}_{index}"
+                ),
             )
         valid_mapping = (
             student_files
@@ -1251,6 +1369,7 @@ def teacher_tab_paper_evaluation():
                     text=f"Evaluating {uploaded_file.name} ({index + 1}/{total_files})...",
                 )
                 submission = None
+                sheet_paths = None
                 try:
                     pages = compress_uploaded_pages(uploaded_file)
                     sheet_paths = upload_page_images(
@@ -1278,6 +1397,13 @@ def teacher_tab_paper_evaluation():
                     logger.exception(
                         "Could not evaluate answer sheet %s", uploaded_file.name
                     )
+                    if submission is None and sheet_paths:
+                        try:
+                            remove_unreferenced_exam_files(sheet_paths)
+                        except Exception:
+                            logger.exception(
+                                "Could not clean up an unsubmitted answer sheet"
+                            )
                     if submission is not None:
                         try:
                             record_paper_evaluation_error(
@@ -1295,22 +1421,15 @@ def teacher_tab_paper_evaluation():
                     (index + 1) / total_files,
                     text=f"Completed {index + 1} of {total_files} answer sheets.",
                 )
-            if errors:
-                st.warning("Some answer sheets could not be evaluated:")
-                for error in errors:
-                    st.error(error)
-            else:
-                st.success(f"Evaluated {total_files} answer sheet(s).")
+            st.session_state[upload_result_key] = {
+                "total_files": total_files,
+                "errors": errors,
+            }
+            st.session_state[upload_generation_key] += 1
+            st.rerun()
 
     st.divider()
     st.subheader("Teacher review & audit")
-    try:
-        submissions = get_paper_submissions_for_teacher(
-            exam["exam_id"], teacher_id
-        )
-    except Exception as error:
-        st.error(f"Could not load paper submissions: {error}")
-        return
     if not submissions:
         st.info("No answer sheets have been submitted for this exam yet.")
         return

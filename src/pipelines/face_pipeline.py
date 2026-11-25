@@ -8,36 +8,58 @@ import face_recognition_models
 from PIL import Image
 import streamlit as st
 
-from src.database.db import get_all_students
+from src.database.db import get_all_face_templates, get_all_students
 from src.pipelines.face_matching import (
     FACE_MATCH_THRESHOLD,
     evaluate_face_match,
+    evaluate_face_match_details,
     match_face_embeddings,
 )
 
 
 FACE_EMBEDDING_SIZE = 128
+REQUIRED_FACE_POSES = ('front', 'left', 'right')
 logger = logging.getLogger(__name__)
+
+
+def missing_required_face_poses(captured_poses):
+    captured_poses = set(captured_poses)
+    return [pose for pose in REQUIRED_FACE_POSES if pose not in captured_poses]
 
 
 @st.cache_resource
 def load_dlib_models():
-    detector = dlib.get_frontal_face_detector() 
-
-
+    detector = dlib.get_frontal_face_detector()
     sp = dlib.shape_predictor(
         face_recognition_models.pose_predictor_model_location()
     )
-
     facerec = dlib.face_recognition_model_v1(
         face_recognition_models.face_recognition_model_location()
     )
-
     return detector, sp, facerec
 
 
+@st.cache_resource
+def load_cnn_detector():
+    """CNN face detector — slower but detects profile/side faces reliably."""
+    return dlib.cnn_face_detection_model_v1(
+        face_recognition_models.cnn_face_detector_model_location()
+    )
+
+
+def _detect_faces_with_fallback(image_np, upsample=1):
+    """Try frontal detector; fall back to CNN if no faces found (for profiles)."""
+    detector, _, _ = load_dlib_models()
+    faces = detector(image_np, upsample)
+    if len(faces) == 0:
+        cnn = load_cnn_detector()
+        cnn_faces = cnn(image_np, upsample)
+        faces = [f.rect for f in cnn_faces]
+    return faces
+
+
 def get_face_embeddings(image_np, expected_face_count=0):
-    detector, sp, facerec = load_dlib_models()
+    _, sp, facerec = load_dlib_models()
     height, width = image_np.shape[:2]
     max_dimension = max(height, width)
     if max_dimension > 1600:
@@ -49,9 +71,9 @@ def get_face_embeddings(image_np, expected_face_count=0):
             )
         )
 
-    faces = detector(image_np, 1)
+    faces = _detect_faces_with_fallback(image_np, upsample=1)
     if expected_face_count and len(faces) < expected_face_count:
-        higher_resolution_faces = detector(image_np, 2)
+        higher_resolution_faces = _detect_faces_with_fallback(image_np, upsample=2)
         if len(higher_resolution_faces) > len(faces):
             faces = higher_resolution_faces
 
@@ -94,9 +116,170 @@ def detect_face_boxes(image_np):
     return boxes
 
 
+def estimate_face_orientation(shape):
+    points = np.array([[shape.part(index).x, shape.part(index).y] for index in range(68)], dtype=np.float64)
+    left_eye = points[36:42].mean(axis=0)
+    right_eye = points[42:48].mean(axis=0)
+    nose = points[30]
+    eye_mid = (left_eye + right_eye) / 2.0
+    eye_distance = max(float(np.linalg.norm(right_eye - left_eye)), 1.0)
+    yaw = float(np.degrees(np.arctan2(nose[0] - eye_mid[0], eye_distance)))
+
+    # Approximate zones — no strict angles required:
+    # left_profile / right_profile: past ~40° (ear starting to face camera)
+    # left / right: any noticeable turn from 15° up to 80°
+    # front: broadly centred (within 25°)
+    if yaw < -80:
+        label = 'left_profile'
+    elif yaw < -40:
+        label = 'left_profile'
+    elif yaw < -15:
+        label = 'left'
+    elif yaw > 80:
+        label = 'right_profile'
+    elif yaw > 40:
+        label = 'right_profile'
+    elif yaw > 15:
+        label = 'right'
+    else:
+        label = 'front'
+    return yaw, label
+
+
+def analyze_face_capture(image_np):
+    _, sp, facerec = load_dlib_models()
+    if image_np.ndim != 3 or image_np.shape[2] != 3:
+        return None
+    faces = _detect_faces_with_fallback(image_np, upsample=1)
+    if len(faces) != 1:
+        return {'face_count': len(faces), 'valid': False}
+
+    face = faces[0]
+    shape = sp(image_np, face)
+    embedding = np.asarray(
+        facerec.compute_face_descriptor(image_np, shape, 0),
+        dtype=np.float64,
+    )
+    yaw, pose_label = estimate_face_orientation(shape)
+
+    gray = np.asarray(
+        Image.fromarray(image_np).convert("L"),
+        dtype=np.float64,
+    )
+    left = max(0, min(gray.shape[1], face.left()))
+    top = max(0, min(gray.shape[0], face.top()))
+    right = max(left + 1, min(gray.shape[1], face.right()))
+    bottom = max(top + 1, min(gray.shape[0], face.bottom()))
+    face_gray = gray[top:bottom, left:right]
+    brightness = float(face_gray.mean())
+    gy, gx = np.gradient(face_gray)
+    sharpness = float(np.sqrt(gx * gx + gy * gy).mean())
+    face_width = max(face.right() - face.left(), 1)
+    face_height = max(face.bottom() - face.top(), 1)
+    face_ratio = ((face_width * face_height) / float(gray.shape[0] * gray.shape[1]))
+
+    quality_parts = [
+        1.0 if 35 <= brightness <= 235 else max(0.0, 1.0 - abs(brightness - 135.0) / 135.0),
+        1.0 if sharpness >= 4.0 else max(0.0, sharpness / 4.0),
+        1.0 if face_ratio >= 0.01 else max(0.0, face_ratio / 0.01),
+    ]
+    quality_score = round(sum(quality_parts) / len(quality_parts), 3)
+
+    valid = (
+        brightness >= 30
+        and sharpness >= 2.0
+        and face_ratio >= 0.008
+    )
+    return {
+        'face_count': 1,
+        'valid': bool(valid),
+        'embedding': embedding,
+        'pose_label': pose_label,
+        'yaw_degrees': yaw,
+        'quality_score': quality_score,
+        'brightness': brightness,
+        'sharpness': sharpness,
+        'face_ratio': face_ratio,
+        'box': (int(left), int(top), int(right), int(bottom)),
+        'image_shape': (int(gray.shape[0]), int(gray.shape[1])),
+    }
+
+
+def predict_attendance_details(
+    class_image_np,
+    candidate_student_ids=None,
+    expected_face_count=0,
+):
+    detector, sp, facerec = load_dlib_models()
+    height, width = class_image_np.shape[:2]
+    max_dimension = max(height, width)
+    image_np = class_image_np
+    scale_x = scale_y = 1.0
+    if max_dimension > 1600:
+        scale = 1600 / max_dimension
+        image_np = np.asarray(
+            Image.fromarray(class_image_np).resize(
+                (int(width * scale), int(height * scale)),
+                Image.BOX,
+            )
+        )
+        scale_x = width / image_np.shape[1]
+        scale_y = height / image_np.shape[0]
+
+    faces = detector(image_np, 1)
+    if expected_face_count and len(faces) < expected_face_count:
+        stronger_faces = detector(image_np, 2)
+        if len(stronger_faces) > len(faces):
+            faces = stronger_faces
+
+    model_data = get_trained_model()
+    observations = []
+    recognized_ids = set()
+    for face in faces:
+        shape = sp(image_np, face)
+        encoding = np.asarray(
+            facerec.compute_face_descriptor(image_np, shape, 0),
+            dtype=np.float64,
+        )
+        yaw, orientation = estimate_face_orientation(shape)
+        box = (
+            max(0, min(width, round(face.left() * scale_x))),
+            max(0, min(height, round(face.top() * scale_y))),
+            max(0, min(width, round(face.right() * scale_x))),
+            max(0, min(height, round(face.bottom() * scale_y))),
+        )
+        student_id, distance, second_distance, reason, status, template_pose = (
+            evaluate_face_match_details(
+                encoding,
+                model_data,
+                candidate_student_ids,
+            )
+        )
+        if status == 'recognized' and student_id is not None:
+            if student_id in recognized_ids:
+                status = 'borderline'
+                reason = 'duplicate_detected_face_assignment'
+                student_id = student_id
+            else:
+                recognized_ids.add(student_id)
+        observations.append({
+            'student_id': student_id,
+            'distance': distance,
+            'second_distance': second_distance,
+            'rejection_reason': reason,
+            'status': status,
+            'orientation': orientation,
+            'orientation_degrees': round(yaw, 1),
+            'template_pose': template_pose,
+            'box': box,
+        })
+    return observations
+
+
 @st.cache_resource
 def get_trained_model():
     students = get_all_students()
+    templates = get_all_face_templates()
 
     if not students:
         return None
@@ -129,6 +312,7 @@ def get_trained_model():
 
     embeddings = []
     student_ids = []
+    pose_labels = {}
     valid_students_by_id = {}
 
     for student_id, student in students_by_id.items():
@@ -159,11 +343,33 @@ def get_trained_model():
             )
             continue
 
-        embeddings.append(embedding)
-        student_ids.append(student_id)
         valid_student = dict(student)
         valid_student['student_id'] = student_id
         valid_students_by_id[student_id] = valid_student
+        embeddings.append(embedding)
+        student_ids.append(student_id)
+        pose_labels[len(embeddings) - 1] = 'front'
+
+    for template in templates:
+        if not isinstance(template, dict):
+            continue
+        try:
+            student_id = int(template.get('student_id'))
+            embedding = np.asarray(template.get('embedding'), dtype=np.float64)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if (
+            student_id not in valid_students_by_id
+            or embedding.shape != (FACE_EMBEDDING_SIZE,)
+            or not np.isfinite(embedding).all()
+        ):
+            continue
+        if template.get('model_version') not in (None, 'dlib-128-v1'):
+            continue
+        embedding_index = len(embeddings)
+        embeddings.append(embedding)
+        student_ids.append(student_id)
+        pose_labels[embedding_index] = template.get('pose_label') or 'front'
 
     if not embeddings:
         return None
@@ -172,6 +378,7 @@ def get_trained_model():
         'embeddings': np.vstack(embeddings),
         'student_ids': student_ids,
         'students_by_id': valid_students_by_id,
+        'pose_labels': pose_labels,
     }
 
 
@@ -187,19 +394,6 @@ def predict_attendance(
 ):
     encodings = get_face_embeddings(class_image_np, expected_face_count)
     model_data = get_trained_model()
-
-    if not model_data:
-        detected_student, matched_face_count = match_face_embeddings(
-            encodings,
-            None,
-            candidate_student_ids,
-        )
-        return (
-            detected_student,
-            len(encodings),
-            len(encodings) - matched_face_count,
-        )
-
     detected_student, matched_face_count = match_face_embeddings(
         encodings,
         model_data,

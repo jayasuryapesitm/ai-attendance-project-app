@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import bcrypt
 import httpx
+import numpy as np
 from postgrest.exceptions import APIError
 
 from src.database.config import supabase
@@ -65,6 +66,83 @@ def get_all_students():
         _show_connection_error()
         return []
     return response.data
+
+
+def get_all_face_templates():
+    try:
+        response = (
+            supabase.table('student_face_templates')
+            .select('student_id, pose_label, embedding, model_version, image_quality_score, created_at, updated_at')
+            .execute()
+        )
+    except (RuntimeError, httpx.ConnectError, httpx.TimeoutException, APIError):
+        return []
+    return response.data or []
+
+
+def get_student_face_templates(student_id):
+    response = (
+        supabase.table('student_face_templates')
+        .select('*')
+        .eq('student_id', int(student_id))
+        .execute()
+    )
+    return response.data or []
+
+
+def upsert_student_face_template(
+    student_id,
+    pose_label,
+    embedding,
+    image_quality_score=None,
+    model_version='dlib-128-v1',
+):
+    if pose_label not in {'front', 'left', 'right', 'left_profile', 'right_profile'}:
+        raise ValueError('Unsupported face pose label.')
+    data = {
+        'student_id': int(student_id),
+        'pose_label': pose_label,
+        'embedding': np.asarray(embedding, dtype=np.float64).tolist(),
+        'model_version': model_version,
+        'image_quality_score': image_quality_score,
+        'updated_at': datetime.now(timezone.utc).isoformat(),
+    }
+    existing = (
+        supabase.table('student_face_templates')
+        .select('id')
+        .eq('student_id', int(student_id))
+        .eq('pose_label', pose_label)
+        .execute()
+    )
+    if existing.data:
+        response = (
+            supabase.table('student_face_templates')
+            .update(data)
+            .eq('id', existing.data[0]['id'])
+            .select('*')
+            .execute()
+        )
+    else:
+        response = (
+            supabase.table('student_face_templates')
+            .insert(data)
+            .select('*')
+            .execute()
+        )
+    if not response.data:
+        raise RuntimeError('Could not save the face template.')
+    return response.data[0]
+
+
+def delete_student_face_templates(student_id, pose_label=None):
+    query = (
+        supabase.table('student_face_templates')
+        .delete()
+        .eq('student_id', int(student_id))
+    )
+    if pose_label is not None:
+        query = query.eq('pose_label', pose_label)
+    return query.execute().data or []
 
 def create_student(
     new_name,
@@ -143,7 +221,15 @@ def record_student_biometric_consent(student_id, method):
             "continues, verify that SUPABASE_KEY is a server-side key."
         ) from error
     if not response.data:
-        raise ValueError('Could not record biometric consent.')
+        logger.error(
+            "Biometric consent update returned no student row; student_id=%s",
+            student_id,
+        )
+        raise RuntimeError(
+            "Supabase did not update this student profile. Check that the student "
+            "still exists and that SUPABASE_KEY is a server-side secret/service_role "
+            "key, not an anon/publishable key. Restart the app after updating secrets."
+        )
 
 
 def delete_student_account(student_id):
@@ -765,8 +851,8 @@ def submit_student_exam_attempt(exam_id, student_id, answers, evaluation_result)
         .execute()
         .data
     )
-    if any(row.get("student_answers") is not None for row in existing):
-        raise ValueError("You have already submitted this exam.")
+    if existing:
+        raise ValueError("A submission already exists for this exam.")
     response = (
         supabase.table("paper_submissions")
         .insert({
@@ -977,6 +1063,17 @@ def insert_paper_submission(exam_id, teacher_id, student_id, sheet_path):
     )
     if not enrollment.data:
         raise ValueError("The selected student is not enrolled in this subject.")
+    existing = (
+        supabase.table("paper_submissions")
+        .select("submission_id")
+        .eq("exam_id", exam_id)
+        .eq("student_id", student_id)
+        .execute()
+    )
+    if existing.data:
+        raise ValueError(
+            "This student already has a submission for this exam."
+        )
     response = (
         supabase.table("paper_submissions")
         .insert({

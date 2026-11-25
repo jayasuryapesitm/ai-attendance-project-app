@@ -4,7 +4,10 @@ from unittest.mock import patch
 import numpy as np
 
 from src.pipelines import face_pipeline
-from src.pipelines.face_pipeline import get_trained_model
+from src.pipelines.face_pipeline import (
+    get_trained_model,
+    missing_required_face_poses,
+)
 from src.pipelines.face_matching import match_face_embeddings
 
 
@@ -18,6 +21,18 @@ class MatchFaceEmbeddingsTests(unittest.TestCase):
             ]),
             'student_ids': [10, 20, 30],
         }
+
+    def test_registration_requires_front_and_both_slight_side_poses(self):
+        self.assertEqual(
+            missing_required_face_poses({"front", "left"}),
+            ["right"],
+        )
+        self.assertEqual(
+            missing_required_face_poses(
+                {"front", "left", "right", "left_profile"}
+            ),
+            [],
+        )
 
     def test_matches_only_students_enrolled_in_the_selected_subject(self):
         detected, matched_count = match_face_embeddings(
@@ -90,9 +105,9 @@ class MatchFaceEmbeddingsTests(unittest.TestCase):
         self.assertEqual(detected, {10: True})
         self.assertEqual(matched_count, 1)
 
-    def test_accepts_a_single_profile_at_the_inclusive_distance_limit(self):
+    def test_accepts_a_single_profile_at_the_strong_inclusive_limit(self):
         detected, matched_count = match_face_embeddings(
-            [np.array([0.45, 0.0])],
+            [np.array([0.3375, 0.0])],
             {
                 'embeddings': np.array([[0.0, 0.0]]),
                 'student_ids': [10],
@@ -170,6 +185,52 @@ class MatchFaceEmbeddingsTests(unittest.TestCase):
 
         self.assertEqual(face_count, 1)
         self.assertIsNone(student)
+
+    def test_groups_multiple_poses_for_one_student(self):
+        model_data = {
+            'embeddings': np.array([
+                [0.0, 0.0],
+                [0.8, 0.0],
+                [0.1, 0.0],
+            ]),
+            'student_ids': [10, 20, 10],
+            'pose_labels': {0: 'front', 1: 'left_profile', 2: 'right'},
+        }
+        student_id, distance, _, reason, status, pose = (
+            face_pipeline.evaluate_face_match_details(
+                np.array([0.0, 0.0]),
+                model_data,
+                candidate_student_ids=[10, 20],
+            )
+        )
+        self.assertEqual(student_id, 10)
+        self.assertEqual(status, 'recognized')
+        self.assertIsNone(reason)
+        self.assertIn(pose, {'front', 'right'})
+
+    def test_borderline_match_is_not_automatically_recognized(self):
+        student_id, _, _, _, status, _ = (
+            face_pipeline.evaluate_face_match_details(
+                np.array([0.34, 0.0]),
+                {
+                    'embeddings': np.array([[0.0, 0.0], [0.8, 0.0]]),
+                    'student_ids': [10, 20],
+                },
+            )
+        )
+        self.assertEqual(student_id, 10)
+        self.assertEqual(status, 'borderline')
+
+    def test_duplicate_templates_do_not_create_ambiguous_student_margin(self):
+        detected, matched_count = match_face_embeddings(
+            [np.array([0.02, 0.0])],
+            {
+                'embeddings': np.array([[0.0, 0.0], [0.06, 0.0], [0.8, 0.0]]),
+                'student_ids': [10, 10, 20],
+            },
+        )
+        self.assertEqual(detected, {10: True})
+        self.assertEqual(matched_count, 1)
 
     def test_skips_invalid_profiles_without_breaking_student_id_mapping(self):
         valid_embedding = np.zeros(128, dtype=np.float64).tolist()

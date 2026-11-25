@@ -44,6 +44,41 @@ create unique index if not exists paper_submissions_one_online_attempt_idx
     on public.paper_submissions (exam_id, student_id)
     where student_answers is not null;
 
+create or replace function public.enforce_one_paper_submission_per_student()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+    perform 1
+    from public.exam_papers
+    where exam_id = new.exam_id
+    for update;
+
+    if not found then
+        raise exception 'The exam does not exist.';
+    end if;
+
+    if exists (
+        select 1
+        from public.paper_submissions
+        where exam_id = new.exam_id
+          and student_id = new.student_id
+    ) then
+        raise exception 'This student already has a submission for this exam.';
+    end if;
+
+    return new;
+end;
+$$;
+
+drop trigger if exists paper_submissions_one_per_student
+    on public.paper_submissions;
+create trigger paper_submissions_one_per_student
+before insert on public.paper_submissions
+for each row
+execute function public.enforce_one_paper_submission_per_student();
+
 create index if not exists exam_papers_teacher_subject_idx
     on public.exam_papers (teacher_id, subject_id, created_at desc);
 create index if not exists paper_submissions_exam_status_idx
