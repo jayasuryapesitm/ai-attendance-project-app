@@ -7,3 +7,4 @@ src/.git-backup/
 .streamlit/secrets.toml
 
 .streamlit/secrets.toml.toml
+**/.streamlit/secrets.toml

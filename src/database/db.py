@@ -56,6 +56,10 @@ def teacher_login(username, password):
 def get_all_students():
     try:
         response = supabase.table('students').select("*").execute()
+    except RuntimeError as error:
+        from streamlit import error as show_error
+        show_error(str(error))
+        return []
     except (httpx.ConnectError, httpx.TimeoutException):
         _show_connection_error()
         return []

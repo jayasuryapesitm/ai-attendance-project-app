@@ -21,6 +21,11 @@ reloads the PostgREST schema cache. The app stores face and voice embeddings as
 arrays of floating-point values. Use the server-side `SUPABASE_KEY` configured
 in Streamlit secrets to access the table.
 
+For FaceID sign-in or profile setup, allow camera access in the browser and
+Windows privacy settings. If another app or browser tab is using the webcam,
+close it or upload a clear JPG/PNG face photo instead. Captured and uploaded
+photos are processed in memory for face matching and are not retained.
+
 ## Student voice attendance
 
 Before using student voice attendance, run `sql/voice_attendance_submissions.sql`
@@ -63,12 +68,17 @@ open the QR link from their devices. Teachers should close a session or open a
 new one for that subject to finalize it; students without a submitted check-in
 are then recorded absent, while borderline requests remain available for review.
 
-Students explicitly consent before using face or voice matching. A strong face
-match (distance at most 0.45) or voice match (similarity at least 0.80) records
-attendance automatically. Borderline matches are sent to **Live Check-in**
+Students explicitly consent before using face or voice matching. During
+check-in, a strong face match (distance at most 0.3375) or voice match
+(similarity at least 0.80) records attendance automatically. Borderline face
+matches (distance above 0.3375 and at most 0.45) are sent to **Live Check-in**
 teacher review; unmatched attempts are not marked present. These thresholds
 are initial engineering defaults, not validated identity guarantees: evaluate
 them with consented, representative data before any real-world deployment.
+Face recognition rejects distances above 0.45 and also rejects a result unless
+the best registered profile is at least 0.05 distance units closer than the
+second-best profile. The camera flow has no liveness detection, so a photograph
+may still be accepted if its face embedding passes these matching checks.
 Voice verification is available as an alternative to face verification. GPS
 sharing is optional, and accuracy above 200 metres is shown as a review flag,
 not treated as proof of misconduct. Captured check-in photos and audio are
