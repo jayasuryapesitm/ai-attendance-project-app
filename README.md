@@ -1,6 +1,48 @@
 # ai-attendance-project-app
 
-## SmartAttend interface
+## Mentor portal setup
+
+Run the latest `sql/mentor_mentee.sql` in the Supabase SQL Editor. It creates a
+teacher-attributed assignment-request history, migrates existing mentor
+assignments safely, and keeps existing student, teacher, and attendance records.
+The migration also installs the request, accept, reject, and relationship-ending
+database functions and reloads the PostgREST schema cache.
+
+The workflow is **Teacher Portal → assignment request → Mentor Portal → accept
+or reject**. A teacher selects active mentor(s) and registered student(s); each
+request is recorded as Pending with the teacher ID and request time. A student
+cannot have another Pending or Accepted request. A rejected request remains in
+history and can be requested again. An accepted relationship must be ended
+before the student can be requested for another mentor.
+
+Mentors sign in from **Mentor Portal** and can only see requests addressed to
+their account. They can accept or reject each request; accepting creates the
+active mentor–mentee relationship, while rejecting does not. Only accepted
+students appear under **My Mentees** and in attendance views. Teachers can view
+the status and rejection reason for requests they submitted. Low-attendance
+email alerts are sent only to the current mentor of an accepted mentee.
+
+The app uses the server-side `SUPABASE_KEY` for database operations. Assignment
+RPC functions are restricted to `service_role`; keep this key private. After
+running the migration, restart or refresh ClassLens.ai so the new API schema is
+available.
+
+Configure SMTP in Streamlit secrets for low-attendance email alerts:
+
+```toml
+SMTP_HOST = "smtp.example.com"
+SMTP_PORT = "587"
+SMTP_USERNAME = "smtp-user"
+SMTP_PASSWORD = "smtp-password"
+SMTP_FROM_EMAIL = "attendance@example.com"
+SMTP_USE_TLS = "true"
+```
+
+Attendance at or above 75% does not create an alert. A strictly lower overall
+attendance percentage queues one notification per student per calendar month;
+SMTP failures are stored in notification history and do not block attendance.
+
+## ClassLens.ai interface
 
 Start the application with `streamlit run app.py`. The top navigation keeps the
 Home, Student, Teacher, and Attendance Records views available, and the theme
@@ -34,7 +76,7 @@ AI paper evaluation uses `gemini-3.5-flash-lite` by default. To override it,
 set `GEMINI_MODEL` in the environment or `.streamlit/secrets.toml`; if the
 configured model is unavailable, the evaluator tries supported fallbacks.
 Failed evaluations stay pending; after correcting the model setting and
-restarting SmartAttend, use **Retry AI evaluation** on the saved submission.
+restarting ClassLens.ai, use **Retry AI evaluation** on the saved submission.
 Students may leave sub-questions unanswered and still receive partial credit
 for their other answers. Alternatives in an OR group must have equal question
 marks and matching sub-question counts and marks; the module maximum counts

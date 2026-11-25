@@ -2,9 +2,9 @@ import streamlit as st
 
 
 def header_home():
-    st.title("SmartAttend")
+    st.title("ClassLens.ai")
     st.caption("Academic attendance and classroom check-in")
 
 
 def header_dashboard():
-    st.markdown("#### SmartAttend")
+    st.markdown("#### ClassLens.ai")

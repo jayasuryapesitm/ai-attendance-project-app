@@ -53,6 +53,30 @@ def style_base_layout():
         .stApp label, .stApp [data-testid="stCaptionContainer"] {{
             color: var(--sa-text);
         }}
+        .stApp [data-testid="stMarkdownContainer"] *,
+        .stApp [data-testid="stMetricValue"],
+        .stApp [data-testid="stMetricLabel"] {{
+            color: var(--sa-text);
+        }}
+        .stApp [data-testid="stDataFrame"],
+        .stApp [data-testid="stDataFrame"] * {{
+            color: var(--sa-text) !important;
+        }}
+        .stApp [data-baseweb="tab"] {{
+            color: var(--sa-muted) !important;
+        }}
+        .stApp [data-baseweb="tab"][aria-selected="true"] {{
+            color: var(--sa-primary) !important;
+        }}
+        .stApp [data-testid="stExpander"] {{
+            background: var(--sa-surface) !important;
+            border: 1px solid var(--sa-border) !important;
+            border-radius: 12px;
+        }}
+        .stApp [data-testid="stExpander"] summary,
+        .stApp [data-testid="stExpander"] summary * {{
+            color: var(--sa-text) !important;
+        }}
         .stApp [data-testid="stCaptionContainer"] p,
         .stApp small {{ color: var(--sa-muted) !important; }}
         .stApp [data-testid="stVerticalBlockBorderWrapper"] {{
@@ -71,13 +95,18 @@ def style_base_layout():
             color: var(--sa-muted) !important;
         }}
         .stApp button {{
-            border-radius: 10px;
+            border-radius: 14px;
             border-color: var(--sa-border);
-            white-space: normal;
-            overflow-wrap: anywhere;
-            line-height: 1.15;
+            white-space: nowrap;
+            overflow-wrap: normal;
+            line-height: 1.2;
             min-height: 2.7rem;
-            transition: transform 120ms ease, border-color 120ms ease;
+            touch-action: manipulation;
+            transition:
+                box-shadow 140ms ease,
+                border-color 140ms ease,
+                background-color 140ms ease,
+                filter 100ms ease;
         }}
         .stApp [data-testid="stButton"] button {{
             height: auto;
@@ -116,9 +145,42 @@ def style_base_layout():
         .stApp [data-testid="stButton"] button[kind="secondary"] p {{
             color: var(--sa-text) !important;
         }}
+        .stApp [data-testid="stButton"] button[kind="primary"] {{
+            border-radius: 18px;
+            box-shadow: 0 4px 14px rgba(0, 102, 204, 0.18);
+        }}
         .stApp button:not(:disabled):hover {{
             border-color: var(--sa-primary);
-            transform: translateY(-1px);
+            box-shadow: 0 2px 8px rgba(15, 23, 42, 0.12);
+        }}
+        .stApp [data-testid="stButton"] button[kind="primary"]:not(:disabled):hover {{
+            filter: brightness(1.04);
+            box-shadow: 0 6px 18px rgba(0, 102, 204, 0.24);
+        }}
+        .stApp button:not(:disabled):active {{
+            filter: brightness(0.94);
+            box-shadow: inset 0 1px 3px rgba(15, 23, 42, 0.2);
+        }}
+        .stApp [data-testid="stButton"] button[kind="primary"]:not(:disabled):active {{
+            filter: brightness(0.94);
+            box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.2);
+        }}
+        .stApp button:focus-visible {{
+            outline: 3px solid var(--sa-primary);
+            outline-offset: 2px;
+        }}
+        .stApp button:disabled {{
+            cursor: not-allowed;
+            opacity: 0.62;
+        }}
+        @media (prefers-reduced-motion: reduce) {{
+            .stApp button {{
+                transition: none;
+            }}
+            .stApp [data-testid="stCheckbox"]:has(input[aria-label="Dark mode"]) > label > div:nth-of-type(1),
+            .stApp [data-testid="stCheckbox"]:has(input[aria-label="Dark mode"]) > label > div:nth-of-type(1) > div {{
+                transition: none;
+            }}
         }}
         .stApp input, .stApp textarea,
         .stApp [data-baseweb="select"] > div,
@@ -172,7 +234,15 @@ def style_base_layout():
             padding: 1rem !important;
         }}
         .stApp [data-testid="stException"] * {{ color: #111827 !important; }}
-        .sa-brand {{ font-size: 1.15rem; font-weight: 750; white-space: nowrap; }}
+        .sa-brand {{
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+            font-size: 1.5rem;
+            font-weight: 750;
+            white-space: nowrap;
+        }}
+        .sa-brand-icon {{ font-size: 1.85rem; line-height: 1; }}
         .sa-kicker {{
             color: var(--sa-muted) !important;
             font-size: 0.78rem;
@@ -195,8 +265,96 @@ def style_base_layout():
             font-size: 0.8rem;
             font-weight: 650;
         }}
+        .sa-nav-button [data-testid="stButton"] button {{
+            min-height: 3.25rem;
+            height: 3.25rem;
+            padding: 0.45rem 0.35rem;
+            font-size: 0.88rem;
+            border-radius: 16px;
+        }}
+        .stApp [data-testid="stCheckbox"]:has(input[aria-label="Dark mode"]) {{
+            width: 100%;
+        }}
+        .stApp [data-testid="stCheckbox"]:has(input[aria-label="Dark mode"]) > label {{
+            display: flex !important;
+            flex-wrap: nowrap !important;
+            align-items: center !important;
+            justify-content: flex-end !important;
+            gap: 0.65rem;
+            width: 100%;
+            white-space: nowrap !important;
+        }}
+        .stApp [data-testid="stCheckbox"]:has(input[aria-label="Dark mode"]) [data-testid="stMarkdownContainer"] p {{
+            white-space: nowrap !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
+            margin: 0;
+        }}
+        .stApp [data-testid="stCheckbox"]:has(input[aria-label="Dark mode"]) > label > div:nth-of-type(1) {{
+            position: relative;
+            display: block;
+            flex: 0 0 3.25rem;
+            width: 3.25rem;
+            height: 1.8rem;
+            border-radius: 999px;
+            background: #dbe4f2;
+            box-shadow: inset 0 1px 3px rgba(15, 23, 42, 0.16);
+            transition: background-color 240ms ease, box-shadow 240ms ease;
+        }}
+        .stApp [data-testid="stCheckbox"]:has(input[aria-label="Dark mode"]) > label > div:nth-of-type(1) > div {{
+            position: absolute;
+            top: 0.15rem;
+            left: 0.15rem;
+            display: grid;
+            width: 1.5rem;
+            height: 1.5rem;
+            place-items: center;
+            border-radius: 50%;
+            background: #ffffff;
+            color: #d97706;
+            box-shadow: 0 1px 4px rgba(15, 23, 42, 0.24);
+            transition:
+                transform 240ms cubic-bezier(0.2, 0.8, 0.2, 1),
+                background-color 240ms ease,
+                color 240ms ease;
+        }}
+        .stApp [data-testid="stCheckbox"]:has(input[aria-label="Dark mode"]) > label > div:nth-of-type(1) > div::before {{
+            content: "☀";
+            font-family: "Segoe UI Symbol", sans-serif;
+            font-size: 0.95rem;
+            line-height: 1;
+        }}
+        .stApp [data-testid="stCheckbox"]:has(input[aria-label="Dark mode"]:checked) > label > div:nth-of-type(1) {{
+            background: #273852;
+            box-shadow: inset 0 1px 4px rgba(0, 0, 0, 0.35);
+        }}
+        .stApp [data-testid="stCheckbox"]:has(input[aria-label="Dark mode"]:checked) > label > div:nth-of-type(1) > div {{
+            transform: translateX(1.45rem);
+            background: #182437;
+            color: #fbbf24;
+        }}
+        .stApp [data-testid="stCheckbox"]:has(input[aria-label="Dark mode"]:checked) > label > div:nth-of-type(1) > div::before {{
+            content: "☾";
+        }}
+        .stApp [data-testid="stCheckbox"]:has(input[aria-label="Dark mode"]:focus-visible) > label > div:nth-of-type(1) {{
+            outline: 3px solid var(--sa-primary);
+            outline-offset: 3px;
+        }}
+        @media (max-width: 800px) {{
+            .sa-nav-button [data-testid="stButton"] button {{
+                white-space: normal;
+                font-size: 0.78rem;
+                line-height: 1.05;
+            }}
+        }}
         @media (max-width: 800px) {{
             [data-testid="stMainBlockContainer"] {{ padding-left: 1rem; padding-right: 1rem; }}
+            .sa-brand {{ font-size: 1.25rem; }}
+            .sa-brand-icon {{ font-size: 1.55rem; }}
+            .sa-nav-button [data-testid="stButton"] button {{
+                min-height: 2.8rem;
+                height: auto;
+            }}
         }}
         </style>
         """,
@@ -222,19 +380,34 @@ def render_top_navigation(page):
     st.session_state.setdefault("theme", "light")
     st.session_state.setdefault("theme_switch", st.session_state.theme == "dark")
 
-    columns = st.columns([1.55, 1, 1, 1, 1, 0.9], vertical_alignment="center")
-    with columns[0]:
-        st.markdown('<div class="sa-brand">🎓 SmartAttend</div>', unsafe_allow_html=True)
+    header_columns = st.columns([5, 1.5], vertical_alignment="center")
+    with header_columns[0]:
+        st.markdown(
+            '<div class="sa-brand"><span class="sa-brand-icon" aria-hidden="true">'
+            '🎓</span><span>ClassLens.ai</span></div>',
+            unsafe_allow_html=True,
+        )
         st.caption("Academic attendance")
+
+    with header_columns[1]:
+        st.toggle(
+            "Dark mode",
+            key="theme_switch",
+            on_change=_update_theme,
+            help="Switch between light and dark appearance.",
+        )
 
     routes = (
         ("Home & Portal Gateway", "home"),
         ("Student Portal", "student"),
         ("Teacher Portal", "teacher"),
         ("Attendance Records", "records"),
+        ("Mentor Portal", "mentor"),
     )
-    for column, (label, destination) in zip(columns[1:5], routes):
+    navigation_columns = st.columns(5, gap="small", vertical_alignment="center")
+    for column, (label, destination) in zip(navigation_columns, routes):
         with column:
+            st.markdown('<div class="sa-nav-button">', unsafe_allow_html=True)
             if st.button(
                 label,
                 key=f"top_nav_{destination}",
@@ -244,13 +417,6 @@ def render_top_navigation(page):
                 from src.ui.navigation import navigate_to
 
                 navigate_to(destination)
-
-    with columns[5]:
-        st.toggle(
-            "Dark",
-            key="theme_switch",
-            on_change=_update_theme,
-            help="Switch between light and dark appearance.",
-        )
+            st.markdown("</div>", unsafe_allow_html=True)
 
     st.divider()

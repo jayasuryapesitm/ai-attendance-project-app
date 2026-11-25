@@ -232,6 +232,11 @@ def get_student_attendance(student_id):
 
 def create_attendance(logs):
     response = supabase.table('attendance_logs').insert(logs).execute()
+    try:
+        from src.database.mentor_db import send_pending_mentor_notifications
+        send_pending_mentor_notifications()
+    except Exception:
+        logger.exception("Mentor attendance alert processing failed")
     return response.data
 
 def get_attendance_for_teacher(teacher_id):
@@ -337,6 +342,11 @@ def review_voice_attendance(submission_id, teacher_id, approved):
     ).execute()
     if not response.data:
         raise ValueError('This request was already reviewed or is not in your classes.')
+    try:
+        from src.database.mentor_db import send_pending_mentor_notifications
+        send_pending_mentor_notifications()
+    except Exception:
+        logger.exception("Mentor attendance alert processing failed")
     return response.data
 
 
@@ -376,6 +386,11 @@ def close_class_session(session_id, teacher_id):
     ).execute()
     if not response.data:
         raise ValueError('The class session could not be closed.')
+    try:
+        from src.database.mentor_db import send_pending_mentor_notifications
+        send_pending_mentor_notifications()
+    except Exception:
+        logger.exception("Mentor attendance alert processing failed")
     return response.data[0]
 
 
@@ -537,6 +552,11 @@ def review_class_checkin(checkin_id, teacher_id, approved):
     ).execute()
     if not response.data:
         raise ValueError('This request was already reviewed or is not in your classes.')
+    try:
+        from src.database.mentor_db import send_pending_mentor_notifications
+        send_pending_mentor_notifications()
+    except Exception:
+        logger.exception("Mentor attendance alert processing failed")
     return response.data[0]
 
 
