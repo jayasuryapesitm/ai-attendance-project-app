@@ -50,6 +50,7 @@ def student_dashboard():
         voice_submissions = get_student_voice_attendance(student_id)
 
     _render_student_profile(student_data, logs)
+    _render_multipose_face_enrollment(student_data)
     _render_student_privacy_controls(student_data)
     _render_live_class_checkin(student_data)
 
@@ -468,6 +469,507 @@ def _render_recent_checkins(logs):
         recent["Timestamp"].dt.tz_convert(None).dt.strftime("%Y-%m-%d %H:%M")
     )
     st.dataframe(recent, width="stretch", hide_index=True)
+
+
+def check_pose_orientation(pose, yaw):
+    """Return True if the measured yaw falls in the approximate zone for the requested pose.
+
+    Zones are intentionally wide so a natural, comfortable head turn is enough.
+    No strict angle or asymmetry requirements — any reasonable turn is accepted.
+    """
+    if yaw is None:
+        return False
+    if pose == "front":
+        # Broadly facing camera — within ±25°
+        return abs(yaw) <= 25
+    if pose == "left":
+        # Any noticeable left turn between 15° and 80° left
+        return -80 <= yaw < -15
+    if pose == "right":
+        # Any noticeable right turn between 15° and 80° right
+        return 15 < yaw <= 80
+    if pose == "left_profile":
+        # Ear starting to face camera — just past ~40° is enough, no 90° needed
+        return yaw <= -40
+    if pose == "right_profile":
+        return yaw >= 40
+    return False
+
+
+def get_pose_capture_feedback(pose, analysis):
+    if not analysis:
+        return "Could not process image. Please capture again."
+    face_count = analysis.get("face_count", 0)
+    if face_count == 0:
+        return (
+            "No face detected. Make sure your full head (forehead to chin) is inside "
+            "the frame with good lighting. Step back 1–2 feet if the face touches the borders."
+        )
+    if face_count > 1:
+        return f"{face_count} faces detected. Please ensure only one person is in the camera frame."
+
+    if not analysis.get("valid", False):
+        brightness = analysis.get("brightness", 0.0)
+        sharpness = analysis.get("sharpness", 0.0)
+        face_ratio = analysis.get("face_ratio", 0.0)
+        reasons = []
+        if brightness < 30:
+            reasons.append(f"lighting is too dim (brightness {brightness:.1f})")
+        if sharpness < 2.0:
+            reasons.append(f"image is blurry (sharpness {sharpness:.1f})")
+        if face_ratio < 0.008:
+            reasons.append("face is too far away")
+        reason_str = ", ".join(reasons) if reasons else "quality parameters unmet"
+        return f"Image quality is too low: {reason_str}. Face a light source, hold steady, and retake."
+
+    yaw = analysis.get("yaw_degrees", 0.0)
+    if check_pose_orientation(pose, yaw):
+        return None  # accepted — no additional asymmetry gate
+
+    # Simple directional guidance only
+    if pose == "front":
+        direction = "left" if yaw < -25 else "right"
+        return f"Turn your head back toward the camera — you are facing too far {direction} ({abs(yaw):.0f}°)."
+    if pose == "left":
+        if yaw >= -15:
+            return "Turn your head gently to the LEFT — just enough so the camera sees your left cheek."
+        return "That is too far left. Ease back a little so your face is still mostly visible."
+    if pose == "right":
+        if yaw <= 15:
+            return "Turn your head gently to the RIGHT — just enough so the camera sees your right cheek."
+        return "That is too far right. Ease back a little so your face is still mostly visible."
+    if pose == "left_profile":
+        return (
+            "Turn your head further LEFT — aim for your right ear facing the camera. "
+            "A comfortable ~45° turn is enough, you do NOT need a full 90°."
+        )
+    if pose == "right_profile":
+        return (
+            "Turn your head further RIGHT — aim for your left ear facing the camera. "
+            "A comfortable ~45° turn is enough, you do NOT need a full 90°."
+        )
+    return f"Adjust your head angle (currently {yaw:.0f}°) and retake."
+
+
+def _get_pose_camera_config(pose):
+    configs = {
+        "front": {
+            "title": "Front View",
+            "hud_title": "● LOOK STRAIGHT AT THE CAMERA LENS ●",
+            "hud_subtitle": "Keep your chin level, shoulders relaxed, and face centered",
+            "in_image_instruction": "● LOOK DIRECTLY INTO CAMERA LENS (0°) ●",
+            "camera_label": "📷 Front Pose: Look straight into the camera lens (chin level)",
+            "framing_tip": "📏 Step back 1.5–2 ft until your entire head (forehead to chin) is inside the frame with space above your hair.",
+            "gradient": "linear-gradient(90deg, #1e3a8a, #0284c7)",
+            "hud_bg": "rgba(2, 132, 199, 0.95)",
+            "border_color": "#38bdf8",
+            "arrow_icon": "●",
+        },
+        "left": {
+            "title": "Slight Left View",
+            "hud_title": "⟵ ⟵ TURN HEAD TO YOUR LEFT (~30°) ⟵ ⟵",
+            "hud_subtitle": "Point your nose toward the LEFT edge of your screen · Keep both eyes visible",
+            "in_image_instruction": "⟵ TURN HEAD LEFT (~30°) · Point nose this way ⟵",
+            "camera_label": "📷 Slight Left: Turn head ~30° toward the LEFT edge of your screen",
+            "framing_tip": "⚠️ Turn only ~30° (do not turn into a full profile). Both eyes and right cheek must be visible.",
+            "gradient": "linear-gradient(90deg, #0f766e, #0d9488)",
+            "hud_bg": "rgba(13, 148, 136, 0.95)",
+            "border_color": "#2dd4bf",
+            "arrow_icon": "⟵",
+        },
+        "right": {
+            "title": "Slight Right View",
+            "hud_title": "⟶ ⟶ TURN HEAD TO YOUR RIGHT (~30°) ⟶ ⟶",
+            "hud_subtitle": "Point your nose toward the RIGHT edge of your screen · Keep both eyes visible",
+            "in_image_instruction": "⟶ TURN HEAD RIGHT (~30°) · Point nose this way ⟶",
+            "camera_label": "📷 Slight Right: Turn head ~30° toward the RIGHT edge of your screen",
+            "framing_tip": "⚠️ Turn only ~30° (do not turn into a full profile). Both eyes and left cheek must be visible.",
+            "gradient": "linear-gradient(90deg, #b45309, #d97706)",
+            "hud_bg": "rgba(217, 119, 6, 0.95)",
+            "border_color": "#fbbf24",
+            "arrow_icon": "⟶",
+        },
+        "left_profile": {
+            "title": "Full Left Profile",
+            "hud_title": "⟵ ⟵ ⟵ FULL LEFT PROFILE (TURN LEFT 90°) ⟵ ⟵ ⟵",
+            "hud_subtitle": "Turn head left until your left ear faces the camera (side profile only)",
+            "in_image_instruction": "⟵⟵ TURN TO FULL LEFT PROFILE (90°) ⟵⟵",
+            "camera_label": "📷 Left Profile: Turn head fully left so left ear faces camera",
+            "framing_tip": "📏 Keep head inside the frame so the profile curve of nose and chin is visible.",
+            "gradient": "linear-gradient(90deg, #4c1d95, #6d28d9)",
+            "hud_bg": "rgba(109, 40, 217, 0.95)",
+            "border_color": "#a78bfa",
+            "arrow_icon": "⟵⟵",
+        },
+        "right_profile": {
+            "title": "Full Right Profile",
+            "hud_title": "⟶ ⟶ ⟶ FULL RIGHT PROFILE (TURN RIGHT 90°) ⟶ ⟶ ⟶",
+            "hud_subtitle": "Turn head right until your right ear faces the camera (side profile only)",
+            "in_image_instruction": "⟶⟶ TURN TO FULL RIGHT PROFILE (90°) ⟶⟶",
+            "camera_label": "📷 Right Profile: Turn head fully right so right ear faces camera",
+            "framing_tip": "📏 Keep head inside the frame so the profile curve of nose and chin is visible.",
+            "gradient": "linear-gradient(90deg, #831843, #be185d)",
+            "hud_bg": "rgba(190, 24, 93, 0.95)",
+            "border_color": "#f472b6",
+            "arrow_icon": "⟶⟶",
+        },
+    }
+    return configs.get(pose, configs["front"])
+
+
+def _render_camera_hud_header(cfg):
+    st.markdown(
+        f"""
+        <style>
+        [data-testid="stCameraInput"],
+        [data-testid="stCameraInputWebcamComponent"],
+        [data-testid="stCameraInputWebcamStyledBox"] {{
+            position: relative !important;
+        }}
+        [data-testid="stCameraInputWebcamStyledBox"]::before,
+        [data-testid="stCameraInputWebcamComponent"]::before {{
+            content: "" !important;
+            position: absolute !important;
+            top: 6% !important;
+            left: 50% !important;
+            transform: translateX(-50%) !important;
+            width: 215px !important;
+            height: 275px !important;
+            border: 3px dashed {cfg['border_color']} !important;
+            border-radius: 50% 50% 48% 48% / 58% 58% 42% 42% !important;
+            pointer-events: none !important;
+            z-index: 100 !important;
+            box-shadow: 0 0 0 9999px rgba(10, 15, 26, 0.42) !important;
+        }}
+        [data-testid="stCameraInputWebcamStyledBox"]::after,
+        [data-testid="stCameraInputWebcamComponent"]::after {{
+            content: "{cfg['in_image_instruction']}" !important;
+            position: absolute !important;
+            top: 14px !important;
+            left: 50% !important;
+            transform: translateX(-50%) !important;
+            background: {cfg['hud_bg']} !important;
+            color: #ffffff !important;
+            padding: 7px 18px !important;
+            border-radius: 999px !important;
+            border: 2.5px solid {cfg['border_color']} !important;
+            font-size: 0.92rem !important;
+            font-weight: 800 !important;
+            letter-spacing: 0.04em !important;
+            z-index: 101 !important;
+            pointer-events: none !important;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.75) !important;
+            white-space: nowrap !important;
+            text-align: center !important;
+            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9) !important;
+        }}
+        </style>
+        <div style="background:{cfg['gradient']};color:white;padding:0.75rem 1rem;
+                    border-radius:12px 12px 0 0;border:2px solid {cfg['border_color']};
+                    border-bottom:none;margin-top:0.6rem;box-shadow:0 4px 15px rgba(0,0,0,0.3)">
+            <div style="font-size:1.15rem;font-weight:800;letter-spacing:0.04em;text-align:center;text-shadow:0 2px 4px rgba(0,0,0,0.6)">
+                {cfg['hud_title']}
+            </div>
+            <div style="font-size:0.88rem;opacity:0.95;text-align:center;margin-top:0.25rem;font-weight:500">
+                {cfg['hud_subtitle']}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_camera_hud_footer(cfg):
+    st.markdown(
+        f"""
+        <div style="background:var(--sa-raised-surface, #1e293b);border:1px solid var(--sa-border, #334155);
+                    border-radius:0 0 12px 12px;padding:0.55rem 0.9rem;margin-top:-0.3rem;margin-bottom:0.8rem;
+                    font-size:0.85rem;color:var(--sa-muted, #94a3b8);text-align:center">
+            {cfg['framing_tip']}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_face_pose_guide(pose):
+    configs = {
+        "front": {
+            "title": "Front View",
+            "badge": "Center & Level (0°)",
+            "instruction": "Look directly into the camera lens with your chin level and shoulders squared.",
+            "tip": "Align your eyes with the eye-line marker and keep your forehead and chin fully inside the oval.",
+            "arrow": "●",
+            "angle_cue": "0° Center",
+            "nose_target": 42,
+        },
+        "left": {
+            "title": "Slight Left View",
+            "badge": "Turn Head Left (25°–45°)",
+            "instruction": "Turn your head gently to your left until your nose points toward the left edge of your screen.",
+            "tip": "Turn only ~30°. Keep both eyes and your right cheek clearly visible in the preview.",
+            "arrow": "⟵",
+            "angle_cue": "~30° Left",
+            "nose_target": 26,
+        },
+        "right": {
+            "title": "Slight Right View",
+            "badge": "Turn Head Right (25°–45°)",
+            "instruction": "Turn your head gently to your right until your nose points toward the right edge of your screen.",
+            "tip": "Turn only ~30°. Keep both eyes and your left cheek clearly visible in the preview.",
+            "arrow": "⟶",
+            "angle_cue": "~30° Right",
+            "nose_target": 58,
+        },
+        "left_profile": {
+            "title": "Full Left Profile",
+            "badge": "Left Profile (~90°)",
+            "instruction": "Turn your head fully to your left so your left ear faces the camera.",
+            "tip": "Keep your head inside the frame so the profile outline of your nose and cheek are captured.",
+            "arrow": "⟵⟵",
+            "angle_cue": "90° Left",
+            "nose_target": 14,
+        },
+        "right_profile": {
+            "title": "Full Right Profile",
+            "badge": "Right Profile (~90°)",
+            "instruction": "Turn your head fully to your right so your right ear faces the camera.",
+            "tip": "Keep your head inside the frame so the profile outline of your nose and cheek are captured.",
+            "arrow": "⟶⟶",
+            "angle_cue": "90° Right",
+            "nose_target": 70,
+        },
+    }
+    cfg = configs.get(pose, configs["front"])
+    badge_text = cfg["badge"]
+    instruction = cfg["instruction"]
+    tip = cfg["tip"]
+    arrow = cfg["arrow"]
+    nose_x = cfg["nose_target"]
+    angle_cue = cfg["angle_cue"]
+
+    st.markdown(
+        f"""
+        <style>
+        [data-testid="stCameraInput"] {{
+            position: relative;
+            max-width: 580px;
+            margin: 0.5rem auto 1rem;
+        }}
+        [data-testid="stCameraInput"] > div:first-child {{
+            position: relative;
+            border-radius: 14px;
+            overflow: hidden;
+            border: 2px solid var(--sa-border, #334155);
+        }}
+        /* Cutout oval guide on camera preview */
+        [data-testid="stCameraInput"] > div:first-child::before {{
+            content: "";
+            position: absolute;
+            top: 7%;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 210px;
+            height: 270px;
+            border: 2.5px dashed #38bdf8;
+            border-radius: 50% 50% 48% 48% / 58% 58% 42% 42%;
+            pointer-events: none;
+            z-index: 10;
+            box-shadow: 0 0 0 9999px rgba(10, 15, 26, 0.35);
+        }}
+        /* Eye-level indicator line */
+        [data-testid="stCameraInput"] > div:first-child::after {{
+            content: "▲ ALIGN EYES HERE · {badge_text} ▲";
+            position: absolute;
+            top: 32%;
+            left: 50%;
+            transform: translateX(-50%);
+            color: #e0f2fe;
+            background: rgba(14, 165, 233, 0.65);
+            font-size: 0.68rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            pointer-events: none;
+            z-index: 11;
+            padding: 2px 8px;
+            border-radius: 4px;
+            white-space: nowrap;
+            text-align: center;
+            text-shadow: 0 1px 2px rgba(0,0,0,0.9);
+        }}
+        </style>
+        <div style="background:var(--sa-raised-surface, #1e293b);border:1px solid var(--sa-border, #334155);
+                    border-radius:14px;padding:1rem 1.2rem;margin:0.5rem 0 1rem;display:flex;
+                    gap:1.2rem;align-items:center;box-shadow:0 2px 8px rgba(0,0,0,0.15)">
+            <svg width="90" height="92" viewBox="0 0 84 88" aria-label="Face alignment guide" style="flex:none">
+                <rect x="4" y="3" width="76" height="70" rx="10" fill="none"
+                      stroke="#38bdf8" stroke-width="1.5" stroke-dasharray="4 3"/>
+                <ellipse cx="42" cy="35" rx="22" ry="26" fill="rgba(56, 189, 248, 0.08)"
+                         stroke="#38bdf8" stroke-width="2"/>
+                <line x1="26" y1="31" x2="58" y2="31" stroke="#38bdf8" stroke-width="1" stroke-dasharray="2 2"/>
+                <circle cx="34" cy="31" r="2.5" fill="#38bdf8"/>
+                <circle cx="50" cy="31" r="2.5" fill="#38bdf8"/>
+                <path d="M42 33 L{nose_x} 43" fill="none" stroke="#f59e0b" stroke-width="2.5" stroke-linecap="round"/>
+                <text x="42" y="86" text-anchor="middle" fill="#38bdf8"
+                      font-size="12" font-weight="700">{arrow} {angle_cue}</text>
+            </svg>
+            <div style="flex:1">
+                <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.3rem">
+                    <span style="font-weight:700;font-size:1.05rem">{cfg['title']}</span>
+                    <span style="background:rgba(56, 189, 248, 0.18);color:#38bdf8;padding:0.15rem 0.5rem;
+                                 border-radius:999px;font-size:0.75rem;font-weight:600">
+                        {cfg['badge']}
+                    </span>
+                </div>
+                <div style="font-size:0.92rem;line-height:1.35;margin-bottom:0.35rem">{instruction}</div>
+                <div style="font-size:0.83rem;color:var(--sa-muted, #94a3b8);line-height:1.3">
+                    💡 <strong>Framing tip:</strong> {tip}
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_multipose_face_enrollment(student_data):
+    import numpy as np
+    from PIL import Image
+
+    student_id = student_data["student_id"]
+    pose_stages = [
+        ("front", "Front", 0.0, 18.0),
+        ("left", "Slight left", -18.0, -75.0),
+        ("right", "Slight right", 18.0, 75.0),
+        ("left_profile", "Left profile", -75.0, -180.0),
+        ("right_profile", "Right profile", 75.0, 180.0),
+    ]
+
+    with st.expander("Multi-pose face enrollment"):
+        from src.database.db import get_student_face_templates
+
+        try:
+            templates = get_student_face_templates(student_id)
+        except Exception:
+            templates = []
+        registered = {row.get("pose_label") for row in templates}
+        captures = st.session_state.setdefault("multi_pose_captures", {})
+        capture_quality = st.session_state.setdefault(
+            "multi_pose_capture_quality",
+            {},
+        )
+        completed = registered | set(captures)
+        from src.pipelines.face_pipeline import missing_required_face_poses
+
+        missing_required = missing_required_face_poses(completed)
+        status_lines = [
+            f"{'✅' if pose in completed else '⬜'} {label}: "
+            f"{'Completed' if pose in completed else 'Pending'}"
+            for pose, label, _, _ in pose_stages
+        ]
+        st.caption(" · ".join(status_lines))
+        st.info(
+            "Front, slight left, and slight right poses are required before saving. "
+            "Profile views are optional."
+        )
+        if missing_required:
+            missing_labels = [
+                label for pose, label, _, _ in pose_stages
+                if pose in missing_required
+            ]
+            st.warning("Still required: " + ", ".join(missing_labels))
+        face_consent = st.checkbox(
+            "I consent to storing these pose-specific face templates.",
+            key=f"multi_pose_consent_{student_id}",
+        )
+        pose_key = f"multi_pose_selected_{student_id}"
+        next_pose = st.session_state.pop(
+            f"multi_pose_advance_{student_id}",
+            None,
+        )
+        if next_pose is not None:
+            st.session_state[pose_key] = next_pose
+        elif pose_key not in st.session_state:
+            st.session_state[pose_key] = next(
+                (pose for pose, _, _, _ in pose_stages if pose not in completed),
+                "front",
+            )
+        selected_pose = st.selectbox(
+            "Pose to update",
+            [pose for pose, _, _, _ in pose_stages],
+            format_func=lambda pose: dict((p, label) for p, label, _, _ in pose_stages)[pose],
+            key=pose_key,
+        )
+        pose_label = dict((p, label) for p, label, _, _ in pose_stages)[selected_pose]
+        st.write(f"Requested view: **{pose_label}**")
+        _render_face_pose_guide(selected_pose)
+        cam_cfg = _get_pose_camera_config(selected_pose)
+        _render_camera_hud_header(cam_cfg)
+        photo = st.camera_input(
+            cam_cfg["camera_label"],
+            key=f"multi_pose_camera_{student_id}_{selected_pose}",
+            disabled=not face_consent,
+        )
+        _render_camera_hud_footer(cam_cfg)
+        if photo is not None:
+            with st.spinner("Checking pose quality..."):
+                image = np.asarray(Image.open(photo).convert("RGB"))
+                from src.pipelines.face_pipeline import analyze_face_capture
+
+                analysis = analyze_face_capture(image)
+                feedback = get_pose_capture_feedback(selected_pose, analysis)
+                if feedback:
+                    st.error(feedback)
+                else:
+                        duplicate = any(
+                            float(np.linalg.norm(
+                                np.asarray(existing, dtype=np.float64)
+                                - np.asarray(analysis["embedding"], dtype=np.float64)
+                            )) < 0.08
+                            for pose, existing in captures.items()
+                            if pose != selected_pose
+                        )
+                        if duplicate:
+                            st.warning("This image is too similar to another captured pose.")
+                        else:
+                            captures[selected_pose] = analysis["embedding"].tolist()
+                            capture_quality[selected_pose] = analysis["quality_score"]
+                            next_pose = next(
+                                (
+                                    pose
+                                    for pose, _, _, _ in pose_stages
+                                    if pose not in registered and pose not in captures
+                                ),
+                                None,
+                            )
+                            if next_pose is not None:
+                                st.session_state[
+                                    f"multi_pose_advance_{student_id}"
+                                ] = next_pose
+                            st.rerun()
+        if st.button(
+            "Save completed poses",
+            key=f"save_multi_pose_{student_id}",
+            disabled=not face_consent or not captures or bool(missing_required),
+            type="primary",
+        ):
+            from src.database.db import upsert_student_face_template
+            from src.pipelines.face_pipeline import train_classifier
+
+            saved = 0
+            for pose, embedding in captures.items():
+                upsert_student_face_template(
+                    student_id,
+                    pose,
+                    embedding,
+                    image_quality_score=capture_quality.get(pose),
+                )
+                saved += 1
+            captures.clear()
+            capture_quality.clear()
+            train_classifier()
+            st.success(f"Saved {saved} face template(s).")
+            st.rerun()
 
 
 @st.dialog("Delete student account")
@@ -992,6 +1494,110 @@ def student_screen():
                 "retained. Voice enrollment is optional and stores a numeric "
                 "template, not the recording."
             )
+            st.subheader("Multi-pose face enrollment")
+            import numpy as np
+            from PIL import Image
+            registration_poses = [
+                ("front", "Front"),
+                ("left", "Slight left"),
+                ("right", "Slight right"),
+                ("left_profile", "Left profile"),
+                ("right_profile", "Right profile"),
+            ]
+            from src.pipelines.face_pipeline import missing_required_face_poses
+
+            registration_captures = st.session_state.setdefault(
+                "registration_multi_pose_captures",
+                {},
+            )
+            registration_quality = st.session_state.setdefault(
+                "registration_multi_pose_quality",
+                {},
+            )
+            next_pose = st.session_state.pop("registration_multi_pose_advance", None)
+            if next_pose is not None:
+                st.session_state["registration_multi_pose"] = next_pose
+            elif "registration_multi_pose" not in st.session_state:
+                st.session_state["registration_multi_pose"] = next(
+                    (
+                        pose
+                        for pose, _ in registration_poses
+                        if pose not in registration_captures
+                    ),
+                    "front",
+                )
+            registration_pose = st.selectbox(
+                "Capture pose",
+                [pose for pose, _ in registration_poses],
+                format_func=lambda pose: dict(registration_poses)[pose],
+                key="registration_multi_pose",
+            )
+            registration_pose_label = dict(registration_poses)[registration_pose]
+            registration_consent = st.checkbox(
+                "I consent to creating pose-specific face templates.",
+                key="registration_multi_pose_consent",
+            )
+            _render_face_pose_guide(registration_pose)
+            reg_cam_cfg = _get_pose_camera_config(registration_pose)
+            _render_camera_hud_header(reg_cam_cfg)
+            registration_camera = st.camera_input(
+                reg_cam_cfg["camera_label"],
+                key=f"registration_multi_pose_camera_{registration_pose}",
+                disabled=not registration_consent,
+            )
+            _render_camera_hud_footer(reg_cam_cfg)
+            st.caption(
+                " · ".join(
+                    f"{'✅' if pose in registration_captures else '⬜'} {label}: "
+                    f"{'Completed' if pose in registration_captures else 'Pending'}"
+                    for pose, label in registration_poses
+                )
+            )
+            missing_registration_poses = missing_required_face_poses(
+                registration_captures
+            )
+            if missing_registration_poses:
+                missing_labels = [
+                    label
+                    for pose, label in registration_poses
+                    if pose in missing_registration_poses
+                ]
+                st.warning(
+                    "Capture all required poses before creating the account: "
+                    + ", ".join(missing_labels)
+                )
+            if registration_camera is not None:
+                image = np.asarray(Image.open(registration_camera).convert("RGB"))
+                from src.pipelines.face_pipeline import analyze_face_capture
+                analysis = analyze_face_capture(image)
+                feedback = get_pose_capture_feedback(registration_pose, analysis)
+                if feedback:
+                    st.error(feedback)
+                else:
+                    duplicate = any(
+                        float(np.linalg.norm(
+                            np.asarray(existing, dtype=np.float64)
+                            - np.asarray(analysis["embedding"], dtype=np.float64)
+                        )) < 0.08
+                        for pose, existing in registration_captures.items()
+                        if pose != registration_pose
+                    )
+                    if duplicate:
+                        st.warning("This capture is too similar to a different completed pose.")
+                    else:
+                        registration_captures[registration_pose] = analysis["embedding"].tolist()
+                        registration_quality[registration_pose] = analysis["quality_score"]
+                        next_pose = next(
+                            (
+                                pose
+                                for pose, _ in registration_poses
+                                if pose not in registration_captures
+                            ),
+                            None,
+                        )
+                        if next_pose is not None:
+                            st.session_state["registration_multi_pose_advance"] = next_pose
+                        st.rerun()
             if not photo_source:
                 st.info('Take or upload a clear face photo above to create your profile.')
             new_name = st.text_input("Enter your name", placeholder='E.g. Zulker')
@@ -1017,49 +1623,65 @@ def student_screen():
             if st.button(
                 'Create Account',
                 type='primary',
-                disabled=not photo_source or not face_consent,
+                disabled=not face_consent or bool(missing_registration_poses),
             ):
-                if new_name:
+                registration_captures = st.session_state.get(
+                    "registration_multi_pose_captures",
+                    {},
+                )
+                missing_registration_poses = missing_required_face_poses(
+                    registration_captures
+                )
+                if missing_registration_poses:
+                    st.error(
+                        "Account not created. Capture the front, slight left, "
+                        "and slight right poses first."
+                    )
+                elif new_name:
                     with st.spinner('Creating profile..'):
-                        from src.database.db import create_student
-                        from src.pipelines.face_pipeline import (
-                            get_face_embeddings,
-                            train_classifier,
+                        from src.database.db import (
+                            create_student,
+                            upsert_student_face_template,
                         )
+                        from src.pipelines.face_pipeline import train_classifier
                         from src.pipelines.voice_pipeline import get_voice_embedding
 
-                        encodings= get_face_embeddings(photo_image)
-                        if len(encodings) == 1:
-                            face_emb = encodings[0].tolist()
+                        front_embedding = registration_captures["front"]
+                        voice_emb = None
+                        if audio_data and voice_consent:
+                            voice_emb = get_voice_embedding(audio_data.getvalue())
 
-                            voice_emb = None
-                            if audio_data and voice_consent:
-                                voice_emb = get_voice_embedding(audio_data.getvalue())
-
-                            response_data = create_student(
-                                new_name,
-                                face_embedding=face_emb,
-                                voice_embedding=voice_emb,
-                                face_consent=face_consent,
-                                voice_consent=voice_consent,
+                        response_data = create_student(
+                            new_name,
+                            face_embedding=front_embedding,
+                            voice_embedding=voice_emb,
+                            face_consent=face_consent,
+                            voice_consent=voice_consent,
+                        )
+                        if response_data:
+                            student_id = response_data[0]["student_id"]
+                            for pose, embedding in registration_captures.items():
+                                upsert_student_face_template(
+                                    student_id,
+                                    pose,
+                                    embedding,
+                                    image_quality_score=registration_quality.get(pose),
+                                )
+                            st.session_state.pop(
+                                "registration_multi_pose_captures",
+                                None,
                             )
-
-                            if response_data:
-                                train_classifier()
-                                st.session_state.is_logged_in = True
-                                st.session_state.user_role = 'student'
-                                st.session_state.student_data = response_data[0]
-                                st.session_state['show_student_registration'] = False
-                                st.toast(f'Profile Created! Hi {new_name}!')
-                                st.rerun()
-                        elif len(encodings) > 1:
-                            st.error('Only one face should be visible to register.')
-                        else:
-                            st.error(
-                                'Face not detected in this photo. Retake it with your '
-                                'face centered, well lit, and clearly visible.'
+                            st.session_state.pop(
+                                "registration_multi_pose_quality",
+                                None,
                             )
-
+                            train_classifier()
+                            st.session_state.is_logged_in = True
+                            st.session_state.user_role = 'student'
+                            st.session_state.student_data = response_data[0]
+                            st.session_state['show_student_registration'] = False
+                            st.toast(f'Profile Created! Hi {new_name}!')
+                            st.rerun()
                 else:
                     st.warning('Please enter your name!')
 

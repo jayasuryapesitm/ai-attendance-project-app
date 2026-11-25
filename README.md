@@ -18,8 +18,10 @@ or close it to lock check-in.
 
 Install the packages in `requirements.txt`, set `GEMINI_API_KEY` in the
 environment or `.streamlit/secrets.toml`, and run `sql/paper_evaluation.sql`
-in the Supabase SQL Editor. The migration creates the exam/submission tables
-and a private `exam-sheets` storage bucket. In the Teacher Portal, each exam
+in the Supabase SQL Editor. Rerun this migration to install the one-submission
+database guard; it prevents new duplicates but does not delete existing rows.
+The migration creates the exam/submission tables and a private `exam-sheets`
+storage bucket. In the Teacher Portal, each exam
 gets its own blueprint and question-paper files; selected exams can replace or
 remove their documents without affecting another exam. Exams can also be
 deleted with their submissions and unshared stored files. Map uploaded student
@@ -28,8 +30,9 @@ sheets to enrolled students, then review the AI marks before selecting
 sub-questions, compulsory questions, and OR groups in the teacher marking
 editor. The application compares the configured marks with the blueprint and
 question paper and requires confirmation before creating the exam. Each exam's
-marking scheme is stored on its own exam record. Students can submit one online
-attempt per exam; the scheme identifies compulsory questions and OR groups.
+marking scheme is stored on its own exam record. Each student can have one
+submission per exam, whether uploaded by a teacher or submitted online.
+Students' online attempts use the scheme's compulsory questions and OR groups.
 AI paper evaluation uses `gemini-3.5-flash-lite` by default. To override it,
 set `GEMINI_MODEL` in the environment or `.streamlit/secrets.toml`; if the
 configured model is unavailable, the evaluator tries supported fallbacks.
@@ -67,6 +70,30 @@ For FaceID sign-in or profile setup, allow camera access in the browser and
 Windows privacy settings. If another app or browser tab is using the webcam,
 close it or upload a clear JPG/PNG face photo instead. Captured and uploaded
 photos are processed in memory for face matching and are not retained.
+
+## Multi-pose face templates
+
+Run `sql/face_templates.sql` in the Supabase SQL Editor. The migration creates
+`public.student_face_templates`, copies existing student `face_embedding`
+values into a `front` template once, and is rerunnable. Existing
+single-embedding profiles remain supported; the application also falls back to
+`students.face_embedding` if the template table is unavailable or a student
+has not enrolled additional poses. Supabase service-role access is required,
+and raw embeddings are never displayed in the UI.
+
+In the Student Portal, open **Multi-pose face enrollment**, consent to
+biometric processing, and capture Front, slight left, and slight right views;
+all three are required before creating a profile or saving enrollment templates.
+An on-screen face frame and direction cue guide each capture. Left and right
+profile views are optional. Blurry, dark, multiple-face,
+duplicate, or misaligned captures are rejected and can be retried. Saving
+templates does not overwrite other saved poses.
+
+During classroom face analysis, strong matches are recognized automatically,
+borderline matches are kept for teacher review, and unmatched faces are not
+assigned. The teacher can correct borderline or unmatched faces before
+confirming attendance. Matching is restricted to enrolled students in the
+selected subject, and each student receives only one attendance result.
 
 ## Student voice attendance
 
